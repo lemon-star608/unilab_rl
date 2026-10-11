@@ -548,7 +548,26 @@ def test_flashsac_builder_without_runtime_matches_baseline(
         "min_weight": 0.1,
         "num_buckets": 2000,
     }
-    # The learner constructor kwargs must be exactly the pre-injection set.
+    # The default row schema reproduces the historical packed fp32 layout:
+    # one slab, legacy column offsets, scalar reward, no aux columns.
+    row_schema = runner.kwargs["row_schema"]
+    assert row_schema.reward_heads == 1
+    assert row_schema.aux_width == 0
+    assert row_schema.float_dtype is torch.float32
+    assert len(row_schema.slabs) == 1
+    assert row_schema.slabs[0].dtype is torch.float32
+    assert row_schema.storage_width == 2 * 4 + 2 + 3 + 2 * 6
+    assert row_schema.storage_row_bytes == row_schema.storage_width * 4
+    assert row_schema.field("obs").offset == 0
+    assert row_schema.field("next_obs").offset == 4
+    assert row_schema.field("actions").offset == 8
+    assert row_schema.field("rewards").offset == 10
+    assert row_schema.field("dones").offset == 11
+    assert row_schema.field("truncated").offset == 12
+    assert row_schema.field("critic").offset == 13
+    assert row_schema.field("next_critic").offset == 19
+    # The learner constructor kwargs are exactly the pre-row-schema set; the
+    # only additive key is reward_head_count, matching the learner default.
     assert _FakeLearner.last_kwargs == {
         "device": "cpu",
         "obs_dim": 4,
@@ -579,6 +598,7 @@ def test_flashsac_builder_without_runtime_matches_baseline(
         "normalize_reward": False,
         "normalized_g_max": 1.0,
         "n_step": 1,
+        "reward_head_count": 1,
         "obs_normalization": False,
         "use_amp": False,
         "amp_dtype": "bf16",
@@ -588,3 +608,46 @@ def test_flashsac_builder_without_runtime_matches_baseline(
         "actor_normalize_parameters": True,
         "critic_normalize_parameters": True,
     }
+
+
+def test_flashsac_builder_builds_row_schema_from_owner_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uni_rl.algos.flash_sac.double_buffer as module
+
+    _patch_flashsac_builder(module, monkeypatch)
+
+    cfg = _flashsac_cfg()
+    cfg.algo.algo_params.reward_head_count = 2
+    cfg.algo.algo_params.replay_aux_width = 2
+    cfg.algo.algo_params.replay_float_dtype = "fp16"
+    runner = _build_flashsac_runner(cfg)
+
+    row_schema = runner.kwargs["row_schema"]
+    assert row_schema.reward_heads == 2
+    assert row_schema.aux_width == 2
+    assert row_schema.float_dtype is torch.float16
+    assert row_schema.obs_dim == 4
+    assert row_schema.action_dim == 2
+    assert row_schema.critic_dim == 6
+    assert [slab.dtype for slab in row_schema.slabs] == [
+        torch.float16,
+        torch.float32,
+        torch.float16,
+        torch.int32,
+    ]
+    # obs/next_obs/actions | rewards+flags | critic/next_critic | aux
+    assert _FakeLearner.last_kwargs["reward_head_count"] == 2
+
+
+def test_flashsac_builder_rejects_invalid_row_schema_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uni_rl.algos.flash_sac.double_buffer as module
+
+    _patch_flashsac_builder(module, monkeypatch)
+
+    cfg = _flashsac_cfg()
+    cfg.algo.algo_params.replay_float_dtype = "bf16"
+    with pytest.raises(ValueError, match="fp32"):
+        _build_flashsac_runner(cfg)

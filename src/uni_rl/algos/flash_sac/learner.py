@@ -48,20 +48,24 @@ class RunningMeanStd:
     count: torch.Tensor
 
     @classmethod
-    def create(cls, device: torch.device) -> "RunningMeanStd":
+    def create(cls, device: torch.device, shape: tuple[int, ...] = (1,)) -> "RunningMeanStd":
         return cls(
-            mean=torch.zeros(1, device=device, dtype=torch.float32),
-            var=torch.ones(1, device=device, dtype=torch.float32),
+            mean=torch.zeros(shape, device=device, dtype=torch.float32),
+            var=torch.ones(shape, device=device, dtype=torch.float32),
             count=torch.tensor(1e-4, device=device, dtype=torch.float32),
         )
 
     def update(self, x: torch.Tensor) -> None:
-        x = x.reshape(-1).to(dtype=torch.float32)
+        x = x.to(dtype=torch.float32)
         if x.numel() == 0:
             return
-        batch_mean = x.mean()
-        batch_var = x.var(unbiased=False)
-        batch_count = torch.tensor(float(x.numel()), device=x.device, dtype=torch.float32)
+        # Statistics run per element of the last dimension (reward head);
+        # all leading dimensions are batch. A 1-D input keeps the historical
+        # scalar-stat behaviour with (1,)-shaped mean/var.
+        rows = x.reshape(-1, x.shape[-1]) if x.ndim > 1 else x.reshape(-1, 1)
+        batch_mean = rows.mean(dim=0)
+        batch_var = rows.var(dim=0, unbiased=False)
+        batch_count = torch.tensor(float(rows.shape[0]), device=x.device, dtype=torch.float32)
 
         delta = batch_mean - self.mean
         total_count = self.count + batch_count
@@ -88,7 +92,11 @@ class RunningMeanStd:
 
 
 class RewardNormalizer:
-    """Adaptive reward scaling with running discounted-return statistics."""
+    """Adaptive reward scaling with running discounted-return statistics.
+
+    Statistics are tracked independently per reward head. With the default
+    single head the shapes and math are exactly the historical ones.
+    """
 
     def __init__(
         self,
@@ -96,19 +104,28 @@ class RewardNormalizer:
         g_max: float,
         device: torch.device,
         eps: float = 1e-8,
+        num_heads: int = 1,
     ):
+        if num_heads < 1:
+            raise ValueError(f"num_heads must be >= 1, got {num_heads}")
         self.gamma = gamma
         self.g_max = g_max
         self.eps = eps
         self.device = device
-        self.rms = RunningMeanStd.create(device)
+        self.num_heads = int(num_heads)
+        self.rms = RunningMeanStd.create(device, shape=(self.num_heads,))
         self.g_r = torch.zeros(0, device=device, dtype=torch.float32)
-        self.g_r_max = torch.tensor(0.0, device=device, dtype=torch.float32)
+        self.g_r_max = (
+            torch.tensor(0.0, device=device, dtype=torch.float32)
+            if self.num_heads == 1
+            else torch.zeros(self.num_heads, device=device, dtype=torch.float32)
+        )
 
     def _ensure_g_r_shape(self, num_envs: int) -> None:
-        if self.g_r.shape == (num_envs,):
+        target_shape = (num_envs,) if self.num_heads == 1 else (num_envs, self.num_heads)
+        if self.g_r.shape == target_shape:
             return
-        self.g_r = torch.zeros(num_envs, device=self.device, dtype=torch.float32)
+        self.g_r = torch.zeros(target_shape, device=self.device, dtype=torch.float32)
 
     def update_from_transitions(
         self,
@@ -123,14 +140,35 @@ class RewardNormalizer:
             dones = dones.unsqueeze(0)
         if rewards.numel() == 0:
             return
+        if rewards.ndim == 2:
+            if self.num_heads != 1:
+                raise ValueError(
+                    f"(steps, num_envs) rewards require num_heads=1, got {self.num_heads}"
+                )
+            rewards = rewards.unsqueeze(-1)
+            dones = dones.unsqueeze(-1)
+        elif rewards.ndim == 3:
+            if rewards.shape[-1] != self.num_heads:
+                raise ValueError(
+                    f"reward head count {rewards.shape[-1]} does not match "
+                    f"num_heads={self.num_heads}"
+                )
+            dones = dones.unsqueeze(-1)
+        else:
+            raise ValueError(f"rewards must be (steps, num_envs[, heads]), got ndim={rewards.ndim}")
 
-        num_envs = int(rewards.shape[-1])
+        num_envs = int(rewards.shape[1])
         self._ensure_g_r_shape(num_envs)
-        done = torch.clamp(dones, min=0.0, max=1.0)
 
         for step in range(rewards.shape[0]):
-            self.g_r.mul_(self.gamma * (1.0 - done[step])).add_(rewards[step])
-            self.g_r_max.copy_(torch.maximum(self.g_r_max, self.g_r.abs().max()))
+            step_rewards = rewards[step]
+            step_dones = torch.clamp(dones[step], min=0.0, max=1.0)
+            if self.num_heads == 1:
+                step_rewards = step_rewards.squeeze(-1)
+                step_dones = step_dones.squeeze(-1)
+            self.g_r.mul_(self.gamma * (1.0 - step_dones)).add_(step_rewards)
+            head_max = self.g_r.abs().max() if self.num_heads == 1 else self.g_r.abs().amax(dim=0)
+            self.g_r_max.copy_(torch.maximum(self.g_r_max, head_max))
             self.rms.update(self.g_r)
 
     def normalize(self, rewards: torch.Tensor) -> torch.Tensor:
@@ -210,6 +248,7 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         normalize_reward: bool = True,
         normalized_g_max: float = 5.0,
         n_step: int = 1,
+        reward_head_count: int = 1,
         obs_normalization: bool = False,
         use_amp: bool = False,
         amp_dtype: str = "auto",
@@ -225,9 +264,16 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         self.gamma = gamma
         self.tau = tau
         self.n_step = n_step
+        if int(reward_head_count) < 1:
+            raise ValueError(f"reward_head_count must be >= 1, got {reward_head_count}")
+        self.reward_head_count = int(reward_head_count)
         self.actor_bc_alpha = actor_bc_alpha
         self.obs_dim = obs_dim
         self.critic_obs_dim = critic_obs_dim
+        # critic_obs_dim == 0 declares "no separate critic observation": the
+        # critic consumes the actor observation instead (replay rows then omit
+        # the duplicated critic column groups entirely).
+        self.critic_input_obs_dim = critic_obs_dim if critic_obs_dim > 0 else obs_dim
         self.action_dim = action_dim
         self.update_count = 0
         self._device_type = self.device.type
@@ -272,7 +318,7 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         )
         self.critic = FlashSACDoubleCritic(
             num_blocks=critic_num_blocks,
-            input_dim=self.critic_obs_dim + action_dim,
+            input_dim=self.critic_input_obs_dim + action_dim,
             hidden_dim=critic_hidden_dim,
             num_bins=num_atoms,
             min_v=critic_min_v,
@@ -305,7 +351,12 @@ class FlashSACLearner(LearnerBoilerplateMixin):
             self.obs_normalizer = nn.Identity()
 
         self.reward_normalizer = (
-            RewardNormalizer(gamma=self.gamma, g_max=normalized_g_max, device=self.device)
+            RewardNormalizer(
+                gamma=self.gamma,
+                g_max=normalized_g_max,
+                device=self.device,
+                num_heads=self.reward_head_count,
+            )
             if normalize_reward
             else None
         )
@@ -406,6 +457,7 @@ class FlashSACLearner(LearnerBoilerplateMixin):
             critic_obs_dim=self.critic_obs_dim,
             action_dim=self.action_dim,
             device=self.device,
+            reward_head_count=self.reward_head_count,
         )
         if self.use_update_cycle:
             self._ensure_update_cycle_graph(
@@ -610,6 +662,44 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         pred_log_probs: torch.Tensor,
         gamma: float,
     ) -> torch.Tensor:
+        rewards_h = rewards.unsqueeze(-1) if rewards.ndim == 1 else rewards
+        num_heads = int(rewards_h.shape[1])
+        if next_q_values.shape[0] != 2 * num_heads:
+            raise ValueError(
+                f"critic member count {next_q_values.shape[0]} does not match "
+                f"2x reward heads {num_heads}; a multi-head reward requires a "
+                "2H-member critic (inject a custom learner via runtime_resolver)"
+            )
+        head_losses = []
+        for head in range(num_heads):
+            member = 2 * head
+            head_losses.append(
+                self._head_critic_loss_tensors(
+                    next_q_values[member : member + 2],
+                    next_q_log_probs_full[member : member + 2],
+                    support,
+                    rewards_h[:, head],
+                    dones,
+                    truncated,
+                    actor_entropy,
+                    pred_log_probs[member : member + 2],
+                    gamma,
+                )
+            )
+        return torch.stack(head_losses).mean()
+
+    def _head_critic_loss_tensors(
+        self,
+        next_q_values: torch.Tensor,
+        next_q_log_probs_full: torch.Tensor,
+        support: torch.Tensor,
+        rewards: torch.Tensor,
+        dones: torch.Tensor,
+        truncated: torch.Tensor,
+        actor_entropy: torch.Tensor,
+        pred_log_probs: torch.Tensor,
+        gamma: float,
+    ) -> torch.Tensor:
         next_q_log_probs = select_min_q_log_probs(next_q_values, next_q_log_probs_full)
         target_probs = compute_categorical_td_target(
             support=support,
@@ -677,7 +767,7 @@ class FlashSACLearner(LearnerBoilerplateMixin):
                 gamma,
             )
         reward_scale_std = (
-            torch.sqrt(self.reward_normalizer.rms.var)
+            torch.sqrt(self.reward_normalizer.rms.var).mean()
             if self.reward_normalizer is not None
             else torch.ones((), device=self.device)
         )
@@ -714,11 +804,17 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         next_obs = batch["next_obs"].to(self.device)
         dones = batch["dones"].to(self.device)
         truncated = batch["truncated"].to(self.device)
-        critic_obs = batch["critic"].to(self.device)
-        critic_next_obs = batch["next_critic"].to(self.device)
+        # critic_obs_dim == 0 rows omit the duplicated critic groups; the
+        # critic then consumes the (normalized) actor observation.
+        critic_raw = batch.get("critic")
+        critic_next_raw = batch.get("next_critic")
 
         obs = self._maybe_normalize_obs(obs, update=True)
         next_obs = self._maybe_normalize_obs(next_obs, update=False)
+        critic_obs = critic_raw.to(self.device) if critic_raw is not None else obs
+        critic_next_obs = (
+            critic_next_raw.to(self.device) if critic_next_raw is not None else next_obs
+        )
 
         if self.reward_normalizer is not None:
             rewards = self.reward_normalizer.normalize(rewards)
@@ -772,10 +868,11 @@ class FlashSACLearner(LearnerBoilerplateMixin):
         obs = batch["obs"].to(self.device)
         next_obs = batch["next_obs"].to(self.device)
         expert_actions = batch["actions"].to(self.device)
-        critic_obs = batch["critic"].to(self.device)
+        critic_raw = batch.get("critic")
 
         obs = self._maybe_normalize_obs(obs, update=False)
         next_obs = self._maybe_normalize_obs(next_obs, update=False)
+        critic_obs = critic_raw.to(self.device) if critic_raw is not None else obs
 
         self._pending_actor_metric_values = None
         actor_loss, entropy = self._actor_objective_tensors(

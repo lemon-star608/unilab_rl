@@ -30,6 +30,7 @@ from uni_rl.ipc.replay_pipelines.gpu_resident import (
     GPUResidentReplayPipeline,
     require_offpolicy_replay_device,
 )
+from uni_rl.ipc.row_schema import RowSchema
 from uni_rl.logging import OffPolicyLogger, TraceRecorder
 from uni_rl.logging.metric_schema import METRIC_SCHEMA_VERSION, metric_spec, normalize_metric_map
 from uni_rl.logging.metrics_drain import RewardComponentWindow
@@ -187,6 +188,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         learner_prepare_hook: Callable[[Any, OffPolicyWarmupContext], None] | None = None,
         backend_device_binder: Callable[[str], str | None] | None = None,
         replay_pipeline_factory: Callable[..., GPUResidentReplayPipeline] | None = None,
+        row_schema: RowSchema | None = None,
         target_frequency: int = 1,
         policy_before_critic: bool = False,
         inference_placement: InferencePlacement | None = None,
@@ -361,6 +363,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         # subprocess (e.g. mjwarp); None for backends that need no binding.
         self.backend_device_binder = backend_device_binder
         self.replay_pipeline_factory = replay_pipeline_factory
+        self.row_schema = row_schema
         self._collector_ready = False
         self._learner_coordination = LearnerCoordinationState()
         # Multi-GPU synchronous data parallelism (None = the bit-identical
@@ -1473,6 +1476,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             ingress_slot_rows=self.replay_ingress_slot_rows,
             inference_ring_bytes=0 if gpu_centric_collector else inference_ring_bytes,
             ingress_on_device=gpu_centric_collector,
+            row_schema=self.row_schema,
         )
         warn_if_over_budget(mem_est, label=f"Off-policy ({self.algo_type})")
         raise_if_shared_memory_over_budget(mem_est, label=f"Off-policy ({self.algo_type})")
@@ -1505,6 +1509,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 replay_ingress_slot_rows=self.replay_ingress_slot_rows,
                 collector_tensor_native=gpu_centric_collector,
                 persistent_exploration_scratch=self._persistent_inference_scratch_bytes(),
+                row_schema=self.row_schema,
             )
             raise_if_cuda_memory_over_budget(
                 cuda_tensor_budget,
@@ -1543,6 +1548,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             ingress_slot_rows=self.replay_ingress_slot_rows,
             ingress_depth=self.replay_ingress_depth,
             ingress_device=self.device if gpu_centric_collector else "cpu",
+            row_schema=self.row_schema,
             # CPU transport still owns a CUDA replay device and CPU ingress.
         )
         self._active_replay_buffer = replay_buffer

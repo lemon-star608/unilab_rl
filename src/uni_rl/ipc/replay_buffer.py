@@ -6,9 +6,15 @@ from typing import Any
 
 import torch
 
+from uni_rl.ipc.row_schema import RowSchema
 from uni_rl.ipc.shared_buffer import SharedBufferBase
 
 DEFAULT_REPLAY_INGRESS_DEPTH = 2
+
+
+def _as_slab_list(packed: "torch.Tensor | list[torch.Tensor]") -> "list[torch.Tensor]":
+    """Normalize a packed payload to its per-slab tensor list."""
+    return packed if isinstance(packed, list) else [packed]
 
 
 class ReplayBuffer(SharedBufferBase):
@@ -16,6 +22,10 @@ class ReplayBuffer(SharedBufferBase):
 
     The collector publishes fixed-depth shared ingress slots. The replay
     pipeline advances ``ptr`` and ``size`` only after the device copy commits.
+
+    Row layout is driven by a :class:`RowSchema`. With the default schema
+    (scalar reward, no aux columns, fp32 storage) the layout is exactly the
+    historical single fp32 packed tensor.
     """
 
     DEFAULT_INGRESS_DEPTH = DEFAULT_REPLAY_INGRESS_DEPTH
@@ -31,11 +41,29 @@ class ReplayBuffer(SharedBufferBase):
         critic_dim: int = 0,
         ingress_depth: int = DEFAULT_INGRESS_DEPTH,
         ingress_device: str | torch.device = "cpu",
+        row_schema: RowSchema | None = None,
     ):
         super().__init__(capacity, device, defer_gpu=True)
         self._obs_dim = obs_dim
         self._action_dim = action_dim
         self._critic_dim = critic_dim
+        if row_schema is None:
+            row_schema = RowSchema(
+                obs_dim=obs_dim,
+                action_dim=action_dim,
+                critic_dim=critic_dim,
+            )
+        elif (
+            row_schema.obs_dim != obs_dim
+            or row_schema.action_dim != action_dim
+            or row_schema.critic_dim != critic_dim
+        ):
+            raise ValueError(
+                "row_schema dims do not match the replay buffer dims: "
+                f"schema ({row_schema.obs_dim}, {row_schema.action_dim}, "
+                f"{row_schema.critic_dim}) vs buffer ({obs_dim}, {action_dim}, {critic_dim})"
+            )
+        self._schema = row_schema
         self.last_incremental_h2d_time_s = 0.0
         self.trace_recorder: Any | None = None
         self.trace_thread_time = False
@@ -43,36 +71,32 @@ class ReplayBuffer(SharedBufferBase):
         self._stop_event: Any | None = None
 
         self.size = torch.zeros(1, dtype=torch.int64).share_memory_()
-        self._init_packed_layout(obs_dim, action_dim, critic_dim)
-        self._ingress_slots: list[torch.Tensor] = []
+        self._init_packed_layout()
+        self._ingress_slots: list[torch.Tensor | list[torch.Tensor]] = []
         self._init_bounded_ingress(
             slot_rows=ingress_slot_rows,
             depth=int(ingress_depth),
             ingress_device=ingress_device,
         )
 
-    def _init_packed_layout(self, obs_dim: int, action_dim: int, critic_dim: int) -> None:
-        self._storage_width = 2 * obs_dim + action_dim + 3 + 2 * critic_dim
-
-        c = 0
-        self._obs_sl = slice(c, c + obs_dim)
-        c += obs_dim
-        self._nobs_sl = slice(c, c + obs_dim)
-        c += obs_dim
-        self._act_sl = slice(c, c + action_dim)
-        c += action_dim
-        self._rew_col = c
-        c += 1
-        self._done_col = c
-        c += 1
-        self._trunc_col = c
-        c += 1
-
-        if critic_dim > 0:
-            self._critic_sl = slice(c, c + critic_dim)
-            c += critic_dim
-            self._ncritic_sl = slice(c, c + critic_dim)
-            c += critic_dim
+    def _init_packed_layout(self) -> None:
+        schema = self._schema
+        self._storage_width = schema.storage_width
+        # Legacy in-slab column slices (exactly the historical packed offsets
+        # for the default single-slab fp32 schema).
+        for name, attr in (
+            ("obs", "_obs_sl"),
+            ("next_obs", "_nobs_sl"),
+            ("actions", "_act_sl"),
+            ("critic", "_critic_sl"),
+            ("next_critic", "_ncritic_sl"),
+        ):
+            if schema.has_field(name):
+                field = schema.field(name)
+                setattr(self, attr, slice(field.offset, field.offset + field.width))
+        self._rew_col = schema.field("rewards").offset
+        self._done_col = schema.field("dones").offset
+        self._trunc_col = schema.field("truncated").offset
 
     def _init_bounded_ingress(
         self,
@@ -94,13 +118,23 @@ class ReplayBuffer(SharedBufferBase):
             raise RuntimeError(
                 f"CUDA replay ingress requested on unavailable {self._ingress_device}"
             )
-        self._ingress_slots = [
-            torch.empty(
-                (slot_rows, self._storage_width),
-                dtype=torch.float32,
-                device=self._ingress_device,
-            ).share_memory_()
+        slabs = self._schema.slabs
+        self._ingress_slabs: list[list[torch.Tensor]] = [
+            [
+                torch.empty(
+                    (slot_rows, slab.width),
+                    dtype=slab.dtype,
+                    device=self._ingress_device,
+                ).share_memory_()
+                for slab in slabs
+            ]
             for _ in range(depth)
+        ]
+        # Single-slab schemas (the default) keep the historical bare-tensor
+        # ingress slots; multi-slab schemas expose the per-slab list.
+        self._ingress_slots = [
+            slot_slabs[0] if len(slot_slabs) == 1 else slot_slabs
+            for slot_slabs in self._ingress_slabs
         ]
         self._ingress_starts = torch.zeros(depth, dtype=torch.int64).share_memory_()
         self._ingress_counts = torch.zeros(depth, dtype=torch.int64).share_memory_()
@@ -126,6 +160,10 @@ class ReplayBuffer(SharedBufferBase):
         return self._storage_width
 
     @property
+    def row_schema(self) -> RowSchema:
+        return self._schema
+
+    @property
     def ingress_slot_rows(self) -> int:
         return self._ingress_slot_rows
 
@@ -133,7 +171,11 @@ class ReplayBuffer(SharedBufferBase):
     def host_storage_bytes(self) -> int:
         if self._ingress_device.type == "cuda":
             return 0
-        return sum(slot.numel() * slot.element_size() for slot in self._ingress_slots)
+        return sum(
+            slab.numel() * slab.element_size()
+            for slot_slabs in self._ingress_slabs
+            for slab in slot_slabs
+        )
 
     @property
     def ingress_device(self) -> torch.device:
@@ -195,14 +237,22 @@ class ReplayBuffer(SharedBufferBase):
     def attach_stop_event(self, stop_event: Any) -> None:
         self._stop_event = stop_event
 
-    def take_published_ingress(self) -> tuple[int, int, int, torch.Tensor] | None:
+    def take_published_ingress(
+        self,
+    ) -> tuple[int, int, int, torch.Tensor | list[torch.Tensor]] | None:
         if not self._ingress_ready.acquire(block=False):
             return None
         slot = self._ingress_consume_seq % self._ingress_depth
         self._ingress_consume_seq += 1
         start = int(self._ingress_starts[slot])
         count = int(self._ingress_counts[slot])
-        return slot, start, count, self._ingress_slots[slot][:count]
+        slot_slabs = self._ingress_slabs[slot]
+        packed: torch.Tensor | list[torch.Tensor]
+        if len(slot_slabs) == 1:
+            packed = slot_slabs[0][:count]
+        else:
+            packed = [slab[:count] for slab in slot_slabs]
+        return slot, start, count, packed
 
     def commit_ingress(self, *, slot: int, start: int, count: int) -> None:
         expected_slot = self._ingress_release_seq % self._ingress_depth
@@ -227,10 +277,12 @@ class ReplayBuffer(SharedBufferBase):
         for _ in range(self._ingress_depth):
             self._ingress_free.release()
         self._ingress_slots.clear()
+        self._ingress_slabs.clear()
 
     def release_ipc(self) -> None:
         """Release this process's ingress IPC views without closing the buffer."""
         self._ingress_slots.clear()
+        self._ingress_slabs.clear()
 
     def __getstate__(self) -> dict:
         """Custom pickle support.
@@ -257,12 +309,18 @@ class ReplayBuffer(SharedBufferBase):
         critic=None,
         next_critic=None,
         terminal_next_critic=None,
+        aux=None,
     ) -> bool:
         """Add batch (called by collector).
 
         `dones` follows the UniLab env lifecycle contract:
         done = terminated | truncated. Learners must pair it with
         `truncated` when computing bootstrap masks.
+
+        `rewards` is ``(count,)`` for the default single-head schema or
+        ``(count, reward_heads)`` for a multi-head schema. `aux` is the
+        optional per-row int metadata ``(count, aux_width)``; rows are
+        zero-filled when the schema declares aux columns and `aux` is None.
         """
         _trace_ns = time.perf_counter_ns() if self.trace_recorder is not None else 0
         return self._add_to_ingress(
@@ -277,6 +335,7 @@ class ReplayBuffer(SharedBufferBase):
             critic,
             next_critic,
             terminal_next_critic,
+            aux,
             trace_start_ns=_trace_ns,
         )
 
@@ -293,6 +352,7 @@ class ReplayBuffer(SharedBufferBase):
         critic=None,
         next_critic=None,
         terminal_next_critic=None,
+        aux=None,
     ) -> bool:
         """Publish a collector vector in bounded ingress-sized chunks.
 
@@ -313,6 +373,7 @@ class ReplayBuffer(SharedBufferBase):
                 critic=critic,
                 next_critic=next_critic,
                 terminal_next_critic=terminal_next_critic,
+                aux=aux,
             )
 
         def optional_slice(
@@ -334,6 +395,7 @@ class ReplayBuffer(SharedBufferBase):
                 critic=optional_slice(critic, start, end),
                 next_critic=optional_slice(next_critic, start, end),
                 terminal_next_critic=optional_slice(terminal_next_critic, start, end),
+                aux=optional_slice(aux, start, end),
             )
             if not published:
                 return False
@@ -352,6 +414,7 @@ class ReplayBuffer(SharedBufferBase):
         critic,
         next_critic,
         terminal_next_critic,
+        aux,
         *,
         trace_start_ns: int,
     ) -> bool:
@@ -364,6 +427,19 @@ class ReplayBuffer(SharedBufferBase):
         has_critic = self._critic_dim > 0 and critic is not None
         if self._critic_dim > 0 and (critic is None or next_critic is None):
             raise ValueError("ReplayBuffer with critic_dim > 0 requires critic and next_critic")
+        rewards = self._validate_transition_shapes(
+            count,
+            obs,
+            actions,
+            rewards,
+            next_obs,
+            dones,
+            truncated,
+            critic,
+            next_critic,
+            aux,
+            has_critic=has_critic,
+        )
 
         wait_start_ns = time.perf_counter_ns()
         waited_for_free_slot = False
@@ -396,10 +472,10 @@ class ReplayBuffer(SharedBufferBase):
 
         sequence = int(self._ingress_publish_seq[0])
         slot = sequence % self._ingress_depth
-        target = self._ingress_slots[slot][:count]
+        target = self._ingress_slabs[slot]
         try:
             self._write_transition_rows(
-                target,
+                [slab[:count] for slab in target],
                 obs,
                 actions,
                 rewards,
@@ -408,13 +484,15 @@ class ReplayBuffer(SharedBufferBase):
                 truncated,
                 critic,
                 next_critic,
+                aux,
                 has_critic=has_critic,
             )
+            nobs_field = self._schema.field("next_obs")
             self._patch_terminal_next_observations(
-                target[:, self._nobs_sl],
+                target[nobs_field.slab][:count, nobs_field.offset : nobs_field.end],
                 terminal_mask,
                 terminal_next_obs,
-                target[:, self._ncritic_sl] if has_critic else None,
+                self._field_write_view(target, "next_critic", count) if has_critic else None,
                 terminal_next_critic,
             )
             if self._ingress_device.type == "cuda":
@@ -461,9 +539,18 @@ class ReplayBuffer(SharedBufferBase):
             )
         return True
 
-    def _write_transition_rows(
+    def _field_write_view(
         self,
-        target,
+        targets: list[torch.Tensor],
+        field_name: str,
+        count: int,
+    ) -> torch.Tensor:
+        field = self._schema.field(field_name)
+        return targets[field.slab][:count, field.offset : field.end]
+
+    def _validate_transition_shapes(
+        self,
+        count: int,
         obs,
         actions,
         rewards,
@@ -472,20 +559,99 @@ class ReplayBuffer(SharedBufferBase):
         truncated,
         critic,
         next_critic,
+        aux,
         *,
         has_critic: bool,
-    ) -> None:
-        target[:, self._obs_sl] = obs
-        target[:, self._nobs_sl] = next_obs
-        target[:, self._act_sl] = actions
-        target[:, self._rew_col] = rewards
-        target[:, self._done_col] = dones
-        target[:, self._trunc_col] = truncated
+    ):
+        """Fail closed on transition rows that do not match the row schema."""
+        schema = self._schema
+        if tuple(obs.shape) != (count, schema.obs_dim):
+            raise ValueError(f"obs shape {tuple(obs.shape)} != ({count}, {schema.obs_dim})")
+        if tuple(next_obs.shape) != (count, schema.obs_dim):
+            raise ValueError(
+                f"next_obs shape {tuple(next_obs.shape)} != ({count}, {schema.obs_dim})"
+            )
+        if tuple(actions.shape) != (count, schema.action_dim):
+            raise ValueError(
+                f"actions shape {tuple(actions.shape)} != ({count}, {schema.action_dim})"
+            )
+        if tuple(dones.shape) != (count,):
+            raise ValueError(f"dones shape {tuple(dones.shape)} != ({count},)")
+        if tuple(truncated.shape) != (count,):
+            raise ValueError(f"truncated shape {tuple(truncated.shape)} != ({count},)")
+        if rewards.ndim == 1:
+            if schema.reward_heads != 1:
+                raise ValueError(
+                    f"flat (count,) rewards require reward_heads=1, "
+                    f"but the row schema declares reward_heads={schema.reward_heads}"
+                )
+            if rewards.shape[0] != count:
+                raise ValueError(f"rewards shape {tuple(rewards.shape)} != ({count},)")
+            rewards = rewards.unsqueeze(1)
+        elif rewards.ndim != 2 or tuple(rewards.shape) != (count, schema.reward_heads):
+            raise ValueError(
+                f"rewards shape {tuple(rewards.shape)} != ({count}, {schema.reward_heads})"
+            )
         if has_critic:
             assert critic is not None
             assert next_critic is not None
-            target[:, self._critic_sl] = critic
-            target[:, self._ncritic_sl] = next_critic
+            if tuple(critic.shape) != (count, schema.critic_dim):
+                raise ValueError(
+                    f"critic shape {tuple(critic.shape)} != ({count}, {schema.critic_dim})"
+                )
+            if tuple(next_critic.shape) != (count, schema.critic_dim):
+                raise ValueError(
+                    f"next_critic shape {tuple(next_critic.shape)} != "
+                    f"({count}, {schema.critic_dim})"
+                )
+        if schema.aux_width > 0:
+            if aux is not None:
+                if tuple(aux.shape) != (count, schema.aux_width):
+                    raise ValueError(
+                        f"aux shape {tuple(aux.shape)} != ({count}, {schema.aux_width})"
+                    )
+                if aux.is_floating_point() or aux.is_complex():
+                    raise ValueError(f"aux must have an integer dtype, got {aux.dtype}")
+        elif aux is not None:
+            raise ValueError("transitions carry aux data but the row schema declares aux_width=0")
+        return rewards
+
+    def _write_transition_rows(
+        self,
+        targets: list[torch.Tensor],
+        obs,
+        actions,
+        rewards,
+        next_obs,
+        dones,
+        truncated,
+        critic,
+        next_critic,
+        aux,
+        *,
+        has_critic: bool,
+    ) -> None:
+        self._field_write_view(targets, "obs", obs.shape[0]).copy_(obs)
+        self._field_write_view(targets, "next_obs", obs.shape[0]).copy_(next_obs)
+        self._field_write_view(targets, "actions", obs.shape[0]).copy_(actions)
+        self._field_write_view(targets, "rewards", obs.shape[0]).copy_(rewards)
+        self._field_write_view(targets, "dones", obs.shape[0]).copy_(
+            dones.unsqueeze(1),
+        )
+        self._field_write_view(targets, "truncated", obs.shape[0]).copy_(
+            truncated.unsqueeze(1),
+        )
+        if has_critic:
+            assert critic is not None
+            assert next_critic is not None
+            self._field_write_view(targets, "critic", obs.shape[0]).copy_(critic)
+            self._field_write_view(targets, "next_critic", obs.shape[0]).copy_(next_critic)
+        if self._schema.aux_width > 0:
+            aux_view = self._field_write_view(targets, "aux", obs.shape[0])
+            if aux is None:
+                aux_view.zero_()
+            else:
+                aux_view.copy_(aux)
 
     @staticmethod
     def _patch_terminal_next_observations(
@@ -507,17 +673,18 @@ class ReplayBuffer(SharedBufferBase):
         if target_next_critic is not None and terminal_next_critic is not None:
             target_next_critic[terminal_mask] = terminal_next_critic[terminal_mask]
 
-    def field_view(self, packed: torch.Tensor, field_name: str) -> torch.Tensor:
-        field = {
-            "obs": self._obs_sl,
-            "next_obs": self._nobs_sl,
-            "actions": self._act_sl,
-            "rewards": self._rew_col,
-            "dones": self._done_col,
-            "truncated": self._trunc_col,
-            "critic": getattr(self, "_critic_sl", None),
-            "next_critic": getattr(self, "_ncritic_sl", None),
-        }.get(field_name)
-        if field is None:
-            raise KeyError(f"Replay field {field_name!r} is unavailable")
-        return packed[:, field]
+    def field_view(
+        self,
+        packed: torch.Tensor | list[torch.Tensor],
+        field_name: str,
+    ) -> torch.Tensor:
+        """View one row-schema field of a packed payload in storage dtype.
+
+        ``rewards`` / ``dones`` / ``truncated`` are squeezed to 1-D when their
+        group holds a single column, preserving the historical view shapes.
+        """
+        field = self._schema.field(field_name)
+        slab = _as_slab_list(packed)[field.slab]
+        if field.width == 1:
+            return slab[:, field.offset]
+        return slab[:, field.offset : field.end]

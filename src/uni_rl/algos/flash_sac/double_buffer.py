@@ -14,6 +14,7 @@ from uni_rl.algos.flash_sac.learner import FlashSACLearner
 from uni_rl.algos.flash_sac.replay import AgeBiasedReplayPipeline
 from uni_rl.env_contract import EnvFactory
 from uni_rl.ipc.replay_pipelines.gpu_resident import require_offpolicy_replay_device
+from uni_rl.ipc.row_schema import RowSchema
 from uni_rl.offpolicy.actor_adapter import import_actor_adapter_modules
 from uni_rl.offpolicy.double_buffer_runner import DoubleBufferOffPolicyRunner
 from uni_rl.offpolicy.runtime import resolve_actor_adapter_modules, resolve_custom_offpolicy_runtime
@@ -132,6 +133,18 @@ def build_flashsac_double_buffer_runner(
         if custom_runtime.algo_type is not None:
             algo_type = str(custom_runtime.algo_type)
 
+    # Row layout is generated from owner YAML and travels with the run config:
+    # scalar reward (H=1), no aux columns, and fp32 storage reproduce the
+    # historical packed layout bit for bit.
+    row_schema = RowSchema(
+        obs_dim=obs_dim,
+        action_dim=action_dim,
+        critic_dim=critic_obs_dim,
+        reward_heads=int(_algo_param(cfg.algo, "reward_head_count", 1)),
+        aux_width=int(_algo_param(cfg.algo, "replay_aux_width", 0)),
+        float_dtype=_algo_param(cfg.algo, "replay_float_dtype", "fp32"),
+    )
+
     learner_kwargs = {
         "obs_dim": obs_dim,
         "action_dim": action_dim,
@@ -161,6 +174,7 @@ def build_flashsac_double_buffer_runner(
         "normalize_reward": cfg.algo.algo_params.normalize_reward,
         "normalized_g_max": cfg.algo.algo_params.normalized_g_max,
         "n_step": cfg.algo.algo_params.n_step,
+        "reward_head_count": row_schema.reward_heads,
         "obs_normalization": cfg.algo.obs_normalization,
         "use_amp": cfg.training.use_amp,
         "amp_dtype": cfg.algo.algo_params.amp_dtype,
@@ -223,5 +237,6 @@ def build_flashsac_double_buffer_runner(
         inference_placement=inference_placement,
         tensor_runtime_settings=tensor_runtime_settings,
         log_interval=int(cfg.training.log_interval),
+        row_schema=row_schema,
         replay_pipeline_factory=replay_pipeline_factory,
     )

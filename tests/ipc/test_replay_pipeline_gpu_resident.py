@@ -184,6 +184,7 @@ class TestMPSIngressEventLifecycle:
         pipeline._device = torch.device("mps")
         pipeline._capacity = 8
         pipeline._gpu_storage = torch.zeros(8, 2)
+        pipeline._gpu_storage_slabs = [pipeline._gpu_storage]
         pipeline._submitted_ptr = 6
         pipeline._visible_ptr = 6
         pipeline._span_events = deque()
@@ -283,7 +284,9 @@ class TestMPSIngressEventLifecycle:
         pipeline._replay_buffer = Replay()
         pipeline._transfer_backend = Transfer()
         pipeline._gpu_packed = []
+        pipeline._gpu_packed_slabs = []
         pipeline._gpu_storage = torch.zeros(4, 2)
+        pipeline._gpu_storage_slabs = [pipeline._gpu_storage]
         pipeline._host_pinned = False
         pipeline._submit_new_spans = lambda: False
 
@@ -752,3 +755,171 @@ class TestMPSGPUResidentPipeline:
         batch = pipeline.sample_large_batch(1, 8)
 
         assert batch["obs"].device.type == "mps"
+
+
+@cuda_only
+class TestGPUResidentPipelineRowSchema:
+    @pytest.fixture
+    def pipeline_factory(self):
+        created = []
+
+        def _make(rb, **kwargs):
+            kwargs.setdefault("device", "cuda")
+            kwargs.setdefault("sample_count", 16)
+            pipeline = GPUResidentReplayPipeline(rb, **kwargs)
+            created.append(pipeline)
+            return pipeline
+
+        yield _make
+        for pipeline in created:
+            pipeline.close()
+
+    @staticmethod
+    def _schema_buffer(**overrides) -> ReplayBuffer:
+        from uni_rl.ipc.row_schema import RowSchema
+
+        schema_kwargs = {
+            "obs_dim": _OBS_DIM,
+            "action_dim": _ACTION_DIM,
+            "critic_dim": _CRITIC_DIM,
+            "reward_heads": 2,
+            "aux_width": 2,
+        }
+        schema_kwargs.update(overrides)
+        schema = RowSchema(**schema_kwargs)
+        return ReplayBuffer(
+            capacity=64,
+            obs_dim=schema.obs_dim,
+            action_dim=schema.action_dim,
+            device="cuda",
+            critic_dim=schema.critic_dim,
+            ingress_slot_rows=64,
+            row_schema=schema,
+        )
+
+    @staticmethod
+    def _schema_pattern_add(rb: ReplayBuffer, n: int) -> dict[str, torch.Tensor]:
+        rows = torch.arange(n, dtype=torch.float32).unsqueeze(1)
+        pattern = {
+            "obs": rows * 10 + torch.arange(rb._obs_dim, dtype=torch.float32),
+            "actions": rows * 100 + torch.arange(rb._action_dim, dtype=torch.float32),
+            "rewards": rows * 7 + torch.arange(2, dtype=torch.float32),
+            "next_obs": rows * 1000 + torch.arange(rb._obs_dim, dtype=torch.float32),
+            "critic": rows * 5 + torch.arange(rb._critic_dim, dtype=torch.float32),
+            "next_critic": rows * 6 + torch.arange(rb._critic_dim, dtype=torch.float32),
+        }
+        aux = (rows * 3 + torch.arange(2, dtype=torch.float32)).to(torch.int64)
+        assert rb.add(
+            pattern["obs"],
+            pattern["actions"],
+            pattern["rewards"],
+            pattern["next_obs"],
+            torch.zeros(n),
+            torch.ones(n),
+            critic=pattern["critic"],
+            next_critic=pattern["next_critic"],
+            aux=aux,
+        )
+        pattern["aux"] = aux.to(torch.int32)
+        return pattern
+
+    def test_multi_head_aux_storage_sampling_and_manifest(self, pipeline_factory):
+        rb = self._schema_buffer()
+        pattern = self._schema_pattern_add(rb, 64)
+        pipeline = pipeline_factory(rb, sample_count=16)
+
+        assert isinstance(pipeline._gpu_storage, list)
+        assert [slab.dtype for slab in pipeline._gpu_storage] == [torch.float32, torch.int32]
+        _wait_visible(pipeline, 64)
+
+        end_ptr, fields = pipeline.read_committed_fields(("rewards", "dones"), start_ptr=0)
+        assert end_ptr == 64
+        assert fields["rewards"].shape == (64, 2)
+        assert fields["rewards"].dtype == torch.float32
+        torch.testing.assert_close(fields["rewards"].cpu(), pattern["rewards"])
+        assert fields["dones"].shape == (64,)
+
+        batch = pipeline.sample_large_batch(0, 16)
+        assert batch["rewards"].shape == (16, 2)
+        assert batch["rewards"].dtype == torch.float32
+        assert batch["aux"].shape == (16, 2)
+        assert batch["aux"].dtype == torch.int32
+        # Scalar flag and obs groups keep their legacy shapes.
+        assert batch["dones"].shape == (16,)
+        assert batch["obs"].shape == (16, _OBS_DIM)
+        # Sampled rows are exact pattern rows; recover the row id per field.
+        reward_ids = batch["rewards"][:, 0].cpu() / 7
+        torch.testing.assert_close(
+            batch["rewards"].cpu(),
+            reward_ids.unsqueeze(1) * 7 + torch.arange(2, dtype=torch.float32),
+        )
+        assert torch.equal(
+            batch["aux"].cpu(),
+            (reward_ids.unsqueeze(1) * 3 + torch.arange(2, dtype=torch.float32)).to(torch.int32),
+        )
+        torch.testing.assert_close(
+            batch["obs"].cpu(), reward_ids.unsqueeze(1) * 10 + torch.arange(_OBS_DIM)
+        )
+
+        manifest = pipeline.transfer_manifest
+        assert manifest["row_schema"]["reward_heads"] == 2
+        assert manifest["row_schema"]["aux_width"] == 2
+        assert manifest["storage_bytes"] == 64 * pipeline._row_bytes
+        rb.close()
+
+    def test_fp16_storage_samples_back_as_fp32(self, pipeline_factory):
+        rb = self._schema_buffer(float_dtype="fp16")
+        pattern = self._schema_pattern_add(rb, 64)
+        pipeline = pipeline_factory(rb, sample_count=16)
+
+        assert [slab.dtype for slab in pipeline._gpu_storage] == [
+            torch.float16,
+            torch.float32,
+            torch.float16,
+            torch.int32,
+        ]
+        _wait_visible(pipeline, 64)
+        assert torch.equal(
+            pipeline._gpu_storage[0][:, :_OBS_DIM].cpu(),
+            pattern["obs"].to(torch.float16),
+        )
+
+        batch = pipeline.sample_large_batch(1, 16)
+        assert batch["obs"].dtype == torch.float32
+        assert batch["actions"].dtype == torch.float32
+        assert batch["critic"].dtype == torch.float32
+        assert batch["rewards"].dtype == torch.float32
+        reward_ids = batch["rewards"][:, 0].cpu() / 7
+        expected_obs = (
+            reward_ids.unsqueeze(1) * 10 + torch.arange(_OBS_DIM, dtype=torch.float32)
+        ).to(torch.float16)
+        assert torch.equal(batch["obs"].cpu(), expected_obs.to(torch.float32))
+        rb.close()
+
+    def test_default_schema_pipeline_layout_is_unchanged(self, pipeline_factory):
+        rb = _make_replay(capacity=64)
+        pipeline = pipeline_factory(rb, sample_count=8)
+        assert isinstance(pipeline._gpu_storage, torch.Tensor)
+        assert pipeline._gpu_storage.shape == (64, rb.storage_width)
+        assert len(pipeline._gpu_packed) == 2
+        assert pipeline._row_bytes == rb.storage_width * 4
+        manifest = pipeline.transfer_manifest
+        assert manifest["row_schema"]["reward_heads"] == 1
+        assert manifest["row_schema"]["aux_width"] == 0
+        assert manifest["row_schema"]["slabs"] == [
+            {
+                "dtype": "float32",
+                "width": rb.storage_width,
+                "fields": [
+                    "obs",
+                    "next_obs",
+                    "actions",
+                    "rewards",
+                    "dones",
+                    "truncated",
+                    "critic",
+                    "next_critic",
+                ],
+            }
+        ]
+        rb.close()

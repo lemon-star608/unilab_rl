@@ -9,7 +9,7 @@ import numpy as np
 import torch
 
 from uni_rl.algos.common.collector_timing import extract_env_step_breakdown_timing_ms
-from uni_rl.env_contract import EnvFactory
+from uni_rl.env_contract import REPLAY_AUX_INFO_KEY, EnvFactory
 from uni_rl.offpolicy.actor_adapter import get_offpolicy_actor_adapter, import_actor_adapter_modules
 from uni_rl.offpolicy.coordination import (
     LearnerCoordinationState,
@@ -45,6 +45,18 @@ INFERENCE_DEPENDENCY_GRAPH = {
     "reset_boundary": "terminal/reset rows are committed before observation[t+1]",
     "legal_concurrent_work": "replay/metrics work may overlap only after its transition is published",
 }
+
+
+def _per_env_metric_rewards(rewards: Any, num_envs: int) -> Any:
+    """Reduce per-step rewards to one scalar per env for episode metrics.
+
+    Episode metrics track a single scalar reward per env; multi-head rewards
+    are averaged over heads until per-head metric plumbing exists. Flat
+    single-head rewards pass through unchanged.
+    """
+    if rewards.ndim == 1:
+        return rewards
+    return rewards.reshape(num_envs, -1).mean(-1)
 
 
 def _inference_flight_metrics(inference_slot) -> tuple[int, int, int, int]:
@@ -777,13 +789,17 @@ def _run_collector(
             cycle_timing_ms.update(extract_env_step_breakdown_timing_ms(state.info))
 
             # Extract data as numpy
+            aux_t = None
+            aux_np = None
             if tensor_collector:
                 assert obs_t is not None
                 assert critic_t is not None
                 next_obs_t, next_critic_t = cast(
                     tuple[torch.Tensor, torch.Tensor], split_obs_dict(state.obs)
                 )
-                rewards_t = state.reward.to(dtype=torch.float32).ravel()
+                # Replay rows store reward heads as provided ((m,) or (m, H));
+                # the row schema validates the shape downstream.
+                rewards_t = state.reward.to(dtype=torch.float32)
                 truncated_t = state.truncated.to(dtype=torch.float32).ravel()
                 combined_dones_t = (state.terminated | state.truncated).to(dtype=torch.float32)
                 assert rewards_t is not None
@@ -793,10 +809,13 @@ def _run_collector(
                 done_mask_t = combined_dones_t > 0.5
                 assert tensor_metrics is not None
                 tensor_metrics.update(
-                    rewards_t,
+                    _per_env_metric_rewards(rewards_t, num_envs),
                     done_mask_t,
                     truncated_t > 0.5,
                 )
+                aux_t = state.info.get(REPLAY_AUX_INFO_KEY)
+                if aux_t is not None and not isinstance(aux_t, torch.Tensor):
+                    aux_t = torch.as_tensor(aux_t)
                 terminal_final = state.final_observation
                 if terminal_final is not None:
                     terminal_obs_t = terminal_final.get("obs")
@@ -808,7 +827,7 @@ def _run_collector(
                 next_obs_np, next_critic_np = split_obs_dict(state.obs)
                 next_obs_np = np.asarray(next_obs_np, dtype=np.float32)
                 next_critic_np = np.asarray(next_critic_np, dtype=np.float32)
-                rewards_np = np.asarray(state.reward, dtype=np.float32).ravel()
+                rewards_np = np.asarray(state.reward, dtype=np.float32)
                 truncated_np = state.truncated.astype(np.float32, copy=False).ravel()
                 combined_dones = (
                     (state.terminated | state.truncated).astype(np.float32, copy=False).ravel()
@@ -821,6 +840,7 @@ def _run_collector(
                 timeout_mask_np = truncated_np > 0.5
                 done_count_window += int(np.count_nonzero(done_mask_np))
                 timeout_count_window += int(np.count_nonzero(timeout_mask_np))
+                aux_np = state.info.get(REPLAY_AUX_INFO_KEY)
                 terminal_contract = resolve_terminal_observation_contract(
                     next_obs_batch_size=next_obs_np.shape[0],
                     final_observation=state.final_observation,
@@ -874,6 +894,7 @@ def _run_collector(
                     critic=critic_t,
                     next_critic=next_critic_t,
                     terminal_next_critic=terminal_critic_t,
+                    aux=aux_t,
                 )
                 if not published and not stop_event.is_set():
                     raise RuntimeError("replay ingress closed before collector shutdown")
@@ -907,6 +928,7 @@ def _run_collector(
                         if terminal_contract.terminal_critic is not None
                         else None
                     ),
+                    aux=(torch.as_tensor(np.asarray(aux_np)) if aux_np is not None else None),
                 )
                 if not published and not stop_event.is_set():
                     raise RuntimeError("replay ingress closed before collector shutdown")
@@ -930,7 +952,7 @@ def _run_collector(
                 assert combined_dones is not None
                 assert next_obs_np is not None
                 assert next_critic_np is not None
-                current_ep_rewards += rewards_np
+                current_ep_rewards += _per_env_metric_rewards(rewards_np, num_envs)
                 current_ep_lengths += 1
                 reset_mask = combined_dones > 0.5
                 reset_indices = np.where(reset_mask)[0]

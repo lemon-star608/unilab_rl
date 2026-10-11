@@ -133,7 +133,7 @@ class AgeBiasedReplayPipeline(GPUResidentReplayPipeline):
             device=self._device,
             generator=gen,
         )
-        torch.index_select(self._gpu_storage, 0, indices, out=self._gpu_packed[slot])
+        self._index_select_packed(indices, slot=slot)
 
 
 __all__ = ["AgeBiasedReplayPipeline"]

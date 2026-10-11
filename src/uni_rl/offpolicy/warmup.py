@@ -85,6 +85,7 @@ def make_offpolicy_warmup_batch(
     critic_obs_dim: int,
     action_dim: int,
     device: str | torch.device,
+    reward_head_count: int = 1,
 ) -> dict[str, torch.Tensor]:
     """Build a representative replay batch without touching replay state."""
     rows = max(1, int(context.batch_size) * max(1, int(context.updates_per_step)))
@@ -93,16 +94,18 @@ def make_offpolicy_warmup_batch(
     def tensor(*shape: int) -> torch.Tensor:
         return torch.zeros(shape, dtype=torch.float32, device=torch_device)
 
-    return {
+    batch = {
         "obs": tensor(rows, obs_dim),
         "actions": tensor(rows, action_dim),
-        "rewards": tensor(rows),
+        "rewards": tensor(rows) if reward_head_count == 1 else tensor(rows, reward_head_count),
         "next_obs": tensor(rows, obs_dim),
         "dones": tensor(rows),
         "truncated": tensor(rows),
-        "critic": tensor(rows, critic_obs_dim),
-        "next_critic": tensor(rows, critic_obs_dim),
     }
+    if critic_obs_dim > 0:
+        batch["critic"] = tensor(rows, critic_obs_dim)
+        batch["next_critic"] = tensor(rows, critic_obs_dim)
+    return batch
 
 
 __all__ = [

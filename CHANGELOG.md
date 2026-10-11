@@ -17,6 +17,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the learner process and forwarded to the spawn collector.
   `OffPolicyRuntime` gains an optional `replay_pipeline_factory` override;
   without a resolver the builder output is unchanged.
+- Schema-driven replay row layouts (`uni_rl.ipc.row_schema.RowSchema`).
+  The FlashSAC builder generates the row schema from owner config keys
+  `algo.algo_params.reward_head_count` (default 1), `replay_aux_width`
+  (default 0), and `replay_float_dtype` (`"fp32"` default, `"fp16"` for
+  compressed obs/action/critic storage). Rewards store `reward_heads` fp32
+  columns and sample back as `(batch, heads)`; aux columns store per-row
+  int32 env metadata (`env info["replay_aux"]`, zero-filled when absent) and
+  sample back as `(batch, aux_width)`; fp16 groups read back as fp32.
+  Transition rows are validated fail-closed against the schema, and the
+  memory-budget pre-flight follows exact per-slab row bytes. The default
+  schema reproduces the historical packed fp32 layout bit for bit.
+- FlashSAC `RewardNormalizer` tracks statistics independently per reward
+  head (single-head shapes and math are unchanged), and the categorical
+  critic loss expands per head against 2H critic members; the 2H critic
+  network itself is expected from an injected custom learner.
+- `critic_obs_dim == 0` now declares "no separate critic observation" for
+  FlashSAC: replay rows omit the duplicated critic groups and the critic
+  consumes the actor observation.
 
 ## [1.4.11] - 2026-10-09
 

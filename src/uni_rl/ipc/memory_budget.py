@@ -9,8 +9,12 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+from typing import TYPE_CHECKING
 
 from uni_rl.ipc.inference_ring import estimate_inference_ring_bytes
+
+if TYPE_CHECKING:
+    from uni_rl.ipc.row_schema import RowSchema
 
 # CUDA IPC event objects are small in the CUDA API, but each handle has driver
 # bookkeeping and allocator slack.  Reserving a page-sized amount per event is
@@ -158,6 +162,7 @@ def estimate_offpolicy_bytes(
     ingress_slot_rows: int | None = None,
     inference_ring_bytes: int = 0,
     ingress_on_device: bool = False,
+    row_schema: "RowSchema | None" = None,
 ) -> dict[str, int | str]:
     """Estimate host shared memory for bounded off-policy replay ingress."""
     if not isinstance(ingress_on_device, bool):
@@ -188,9 +193,10 @@ def estimate_offpolicy_bytes(
     ):
         raise ValueError("inference_ring_bytes must be a non-negative integer")
     row_width = 2 * obs_dim + action_dim + 3 + 2 * critic_dim
+    row_bytes = row_width * 4 if row_schema is None else row_schema.storage_row_bytes
     capacity = replay_buffer_n * num_envs
     ingress_bytes = (
-        0 if ingress_on_device else ingress_depth * effective_ingress_slot_rows * row_width * 4
+        0 if ingress_on_device else ingress_depth * effective_ingress_slot_rows * row_bytes
     )
     inference_ring_line = (
         f"  Inference ring: {inference_ring_bytes / 1024**2:.0f} MB\n"
@@ -214,7 +220,7 @@ def estimate_offpolicy_bytes(
                 else (
                     f"{ingress_bytes / 1024**2:.0f} MB "
                     f"({int(ingress_depth)} slots × {effective_ingress_slot_rows} rows × "
-                    f"{row_width} cols × 4B)\n"
+                    f"{row_bytes} B)\n"
                 )
             )
             + inference_ring_line
@@ -238,6 +244,7 @@ def estimate_cuda_tensor_runtime_bytes(
     replay_ingress_slot_rows: int,
     collector_tensor_native: bool,
     persistent_exploration_scratch: int = 0,
+    row_schema: "RowSchema | None" = None,
 ) -> dict[str, int | str]:
     """Conservatively pre-flight all startup CUDA tensor-runtime allocations.
 
@@ -276,11 +283,12 @@ def estimate_cuda_tensor_runtime_bytes(
         persistent_exploration_scratch=persistent_exploration_scratch,
     )
     row_width = 2 * obs_dim + action_dim + 3 + 2 * critic_dim
+    row_bytes = row_width * 4 if row_schema is None else row_schema.storage_row_bytes
     replay_capacity = replay_buffer_n * num_envs
-    replay_storage = replay_capacity * row_width * 4
-    learner_batch_slots = 2 * sample_count * row_width * 4
+    replay_storage = replay_capacity * row_bytes
+    learner_batch_slots = 2 * sample_count * row_bytes
     replay_ingress = (
-        replay_ingress_depth * replay_ingress_slot_rows * row_width * 4
+        replay_ingress_depth * replay_ingress_slot_rows * row_bytes
         if collector_tensor_native
         else 0
     )
@@ -293,9 +301,9 @@ def estimate_cuda_tensor_runtime_bytes(
     lines = (
         "CUDA tensor-runtime budget (conservative pre-flight):\n"
         f"  Replay storage: {replay_storage / 1024**2:.1f} MB "
-        f"({replay_capacity} rows × {row_width} cols × 4B)\n"
+        f"({replay_capacity} rows × {row_bytes} B)\n"
         f"  Learner double-buffer batches: {learner_batch_slots / 1024**2:.1f} MB "
-        f"(2 slots × {sample_count} rows × {row_width} cols × 4B)\n"
+        f"(2 slots × {sample_count} rows × {row_bytes} B)\n"
         f"  CUDA replay ingress: {replay_ingress / 1024**2:.1f} MB "
         f"({replay_ingress_depth} × {replay_ingress_slot_rows} rows; "
         f"collector_tensor_native={collector_tensor_native})\n"

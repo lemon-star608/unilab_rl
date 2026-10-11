@@ -88,7 +88,7 @@ def update_reward_stats_from_replay(
     dones = committed_fields["dones"][-count:]
     num_steps = count // num_envs
     learner.update_reward_stats(
-        rewards.view(num_steps, num_envs),
+        rewards.view(num_steps, num_envs, *rewards.shape[1:]),
         dones.view(num_steps, num_envs),
     )
     return end_ptr

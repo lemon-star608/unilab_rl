@@ -318,3 +318,83 @@ def test_shared_memory_budget_raises_before_over_allocating(
     assert "available" in message
     assert "algo.num_envs" in message
     assert "algo.replay_buffer_n" in message
+
+
+def test_budget_estimates_follow_row_schema_storage_bytes() -> None:
+    from uni_rl.ipc.row_schema import RowSchema
+
+    default_estimate = estimate_offpolicy_bytes(
+        num_envs=4,
+        replay_buffer_n=8,
+        obs_dim=4,
+        action_dim=2,
+        critic_dim=5,
+        ingress_depth=2,
+    )
+    default_schema = RowSchema(obs_dim=4, action_dim=2, critic_dim=5)
+    schema_estimate = estimate_offpolicy_bytes(
+        num_envs=4,
+        replay_buffer_n=8,
+        obs_dim=4,
+        action_dim=2,
+        critic_dim=5,
+        ingress_depth=2,
+        row_schema=default_schema,
+    )
+    # The default schema reproduces the legacy fp32 row bytes exactly.
+    assert schema_estimate["bounded_ingress_slots"] == default_estimate["bounded_ingress_slots"]
+
+    fp16_schema = RowSchema(obs_dim=4, action_dim=2, critic_dim=5, float_dtype="fp16")
+    fp16_estimate = estimate_offpolicy_bytes(
+        num_envs=4,
+        replay_buffer_n=8,
+        obs_dim=4,
+        action_dim=2,
+        critic_dim=5,
+        ingress_depth=2,
+        row_schema=fp16_schema,
+    )
+    assert 0 < fp16_estimate["bounded_ingress_slots"] < default_estimate["bounded_ingress_slots"]
+
+    wide_schema = RowSchema(obs_dim=4, action_dim=2, critic_dim=5, reward_heads=2, aux_width=2)
+    wide_estimate = estimate_offpolicy_bytes(
+        num_envs=4,
+        replay_buffer_n=8,
+        obs_dim=4,
+        action_dim=2,
+        critic_dim=5,
+        ingress_depth=2,
+        row_schema=wide_schema,
+    )
+    expected_row_bytes = (2 * 4 + 2 + 3 + 2 * 5 + 1) * 4 + 2 * 4
+    assert wide_schema.storage_row_bytes == expected_row_bytes
+    assert wide_estimate["bounded_ingress_slots"] == 2 * 4 * expected_row_bytes
+
+
+def test_cuda_tensor_runtime_budget_follows_row_schema_storage_bytes() -> None:
+    from uni_rl.ipc.row_schema import RowSchema
+
+    base_kwargs = {
+        "num_envs": 4,
+        "replay_buffer_n": 8,
+        "obs_dim": 4,
+        "action_dim": 2,
+        "critic_dim": 5,
+        "inference_obs_dim": 4,
+        "sample_count": 8,
+        "inference_slot_capacity": 1,
+        "replay_ingress_depth": 2,
+        "replay_ingress_slot_rows": 2,
+        "collector_tensor_native": True,
+    }
+    default_estimate = estimate_cuda_tensor_runtime_bytes(**base_kwargs)
+    default_schema = RowSchema(obs_dim=4, action_dim=2, critic_dim=5)
+    schema_estimate = estimate_cuda_tensor_runtime_bytes(**base_kwargs, row_schema=default_schema)
+    assert schema_estimate["replay_storage"] == default_estimate["replay_storage"]
+    assert schema_estimate["total"] == default_estimate["total"]
+
+    fp16_schema = RowSchema(obs_dim=4, action_dim=2, critic_dim=5, float_dtype="fp16")
+    fp16_estimate = estimate_cuda_tensor_runtime_bytes(**base_kwargs, row_schema=fp16_schema)
+    expected_storage = (4 * 8) * fp16_schema.storage_row_bytes
+    assert fp16_estimate["replay_storage"] == expected_storage
+    assert fp16_estimate["replay_storage"] < default_estimate["replay_storage"]

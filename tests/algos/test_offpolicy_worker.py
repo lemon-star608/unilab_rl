@@ -1244,3 +1244,20 @@ def test_explicit_cpu_transport_rejects_cuda_tensor_observations() -> None:
             trace_enabled=False,
             trace_thread_time=False,
         )
+
+
+@pytest.mark.parametrize("as_tensor", [False, True])
+def test_per_env_metric_rewards_passthrough_and_head_mean(as_tensor: bool) -> None:
+    from uni_rl.offpolicy.worker import _per_env_metric_rewards
+
+    flat_values = [1.0, 2.0, 3.0]
+    flat = torch.tensor(flat_values) if as_tensor else np.asarray(flat_values, dtype=np.float32)
+    assert _per_env_metric_rewards(flat, 3) is flat
+
+    head_values = [[1.0, 3.0], [2.0, 4.0], [4.0, 8.0]]
+    heads = torch.tensor(head_values) if as_tensor else np.asarray(head_values, dtype=np.float32)
+    reduced = _per_env_metric_rewards(heads, 3)
+    torch.testing.assert_close(
+        torch.as_tensor(np.asarray(reduced)),
+        torch.tensor([2.0, 3.0, 6.0]),
+    )
