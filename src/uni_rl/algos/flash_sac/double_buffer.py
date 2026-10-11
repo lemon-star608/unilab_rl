@@ -5,7 +5,7 @@ from __future__ import annotations
 import warnings
 from collections.abc import Callable
 from functools import partial
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from omegaconf import DictConfig, OmegaConf
@@ -14,7 +14,9 @@ from uni_rl.algos.flash_sac.learner import FlashSACLearner
 from uni_rl.algos.flash_sac.replay import AgeBiasedReplayPipeline
 from uni_rl.env_contract import EnvFactory
 from uni_rl.ipc.replay_pipelines.gpu_resident import require_offpolicy_replay_device
+from uni_rl.offpolicy.actor_adapter import import_actor_adapter_modules
 from uni_rl.offpolicy.double_buffer_runner import DoubleBufferOffPolicyRunner
+from uni_rl.offpolicy.runtime import resolve_actor_adapter_modules, resolve_custom_offpolicy_runtime
 from uni_rl.utils.device import get_default_device
 from uni_rl.utils.nan_guard import NanGuardCfg
 from uni_rl.utils.observations import get_obs_dims
@@ -68,6 +70,13 @@ def build_flashsac_double_buffer_runner(
         cfg,
         replay_prefetch_mode=replay_prefetch_mode,
     )
+    rl_cfg = cast(dict[str, Any], OmegaConf.to_container(cfg.algo, resolve=True))
+    custom_runtime = resolve_custom_offpolicy_runtime(rl_cfg)
+    # Import registration modules before the learner builds its actor so
+    # custom adapter registrations are live in this process; the runner
+    # forwards the list to the spawn collector.
+    actor_adapter_modules = resolve_actor_adapter_modules(rl_cfg, custom_runtime)
+    import_actor_adapter_modules(actor_adapter_modules)
     # Resolve public tensor-runtime bounds before constructing a one-env probe.
     # Invalid training knobs must fail closed without materializing a backend.
     tensor_runtime_settings = resolve_tensor_runtime_settings(
@@ -106,6 +115,22 @@ def build_flashsac_double_buffer_runner(
         action_dim = int(action_shape[0])
     finally:
         env.close()
+
+    learner_cls: type[Any] = FlashSACLearner
+    algo_type = "flashsac"
+    learner_extra_kwargs: dict[str, Any] = {}
+    if custom_runtime is not None:
+        learner_extra_kwargs = cast(
+            dict[str, Any],
+            custom_runtime.build_model_kwargs(
+                obs_dim=int(obs_dim),
+                critic_obs_dim=int(critic_obs_dim),
+            ),
+        )
+        if custom_runtime.learner_cls is not None:
+            learner_cls = custom_runtime.learner_cls
+        if custom_runtime.algo_type is not None:
+            algo_type = str(custom_runtime.algo_type)
 
     learner_kwargs = {
         "obs_dim": obs_dim,
@@ -149,12 +174,22 @@ def build_flashsac_double_buffer_runner(
             _algo_param(cfg.algo, "critic_normalize_parameters", True)
         ),
     }
-    learner = FlashSACLearner(device=device, **learner_kwargs)
+    learner_kwargs.update(learner_extra_kwargs)
+    learner = learner_cls(device=device, **learner_kwargs)
+
+    replay_pipeline_factory: Callable[..., Any] = partial(
+        AgeBiasedReplayPipeline,
+        decay_step=int(_algo_param(cfg.algo, "decay_step", 0)),
+        min_weight=float(_algo_param(cfg.algo, "replay_min_weight", 0.1)),
+        num_buckets=int(_algo_param(cfg.algo, "replay_num_buckets", 2000)),
+    )
+    if custom_runtime is not None and custom_runtime.replay_pipeline_factory is not None:
+        replay_pipeline_factory = custom_runtime.replay_pipeline_factory
 
     return DoubleBufferOffPolicyRunner(
         learner=learner,
         env_name=cfg.training.task_name,
-        algo_type="flashsac",
+        algo_type=algo_type,
         env_factory=env_factory,
         num_envs=cfg.algo.num_envs,
         replay_buffer_n=cfg.algo.replay_buffer_n,
@@ -180,14 +215,13 @@ def build_flashsac_double_buffer_runner(
         torch_thread_runtime=torch_thread_runtime,
         collector_cpu_ids=collector_cpu_ids,
         dp_sync=dp_sync,
+        learner_prepare_hook=(
+            custom_runtime.learner_prepare_hook if custom_runtime is not None else None
+        ),
         backend_device_binder=backend_device_binder,
+        actor_adapter_modules=actor_adapter_modules,
         inference_placement=inference_placement,
         tensor_runtime_settings=tensor_runtime_settings,
         log_interval=int(cfg.training.log_interval),
-        replay_pipeline_factory=partial(
-            AgeBiasedReplayPipeline,
-            decay_step=int(_algo_param(cfg.algo, "decay_step", 0)),
-            min_weight=float(_algo_param(cfg.algo, "replay_min_weight", 0.1)),
-            num_buckets=int(_algo_param(cfg.algo, "replay_num_buckets", 2000)),
-        ),
+        replay_pipeline_factory=replay_pipeline_factory,
     )

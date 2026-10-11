@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The FlashSAC double-buffer builder now consumes `OffPolicyRuntime` resolved
+  from `algo.runtime_resolver`, matching the SAC builder: `learner_cls` and
+  `algo_type` are replaceable, runtime `actor_kwargs` merge into the learner
+  constructor, `learner_prepare_hook` is forwarded to the runner, and
+  `algo.actor_adapter_modules` (or runtime-provided modules) are imported in
+  the learner process and forwarded to the spawn collector.
+  `OffPolicyRuntime` gains an optional `replay_pipeline_factory` override;
+  without a resolver the builder output is unchanged.
+
 ## [1.4.11] - 2026-10-09
 
 ### Added

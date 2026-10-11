@@ -14,10 +14,11 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class OffPolicyRuntime:
-    """Optional runtime overrides for the generic off-policy SAC path.
+    """Optional runtime overrides for the generic off-policy builder path.
 
-    All fields are optional so custom runtimes only declare the behaviour they
-    need to change from standard SAC.
+    Consumed by the SAC and FlashSAC double-buffer builders. All fields are
+    optional so custom runtimes only declare the behaviour they need to change
+    from the standard builder defaults.
     """
 
     learner_cls: type[Any] | None = None
@@ -25,6 +26,7 @@ class OffPolicyRuntime:
     actor_kwargs: dict[str, Any] = field(default_factory=dict)
     actor_adapter_modules: tuple[str, ...] = ()
     learner_prepare_hook: Callable[[Any, OffPolicyWarmupContext], None] | None = None
+    replay_pipeline_factory: Callable[..., Any] | None = None
 
     def build_model_kwargs(self, *, obs_dim: int, critic_obs_dim: int) -> dict[str, Any]:
         """Build learner model kwargs from the environment observation contract."""
