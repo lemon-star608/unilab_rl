@@ -372,3 +372,36 @@ def test_default_schema_buffer_rejects_aux_and_multi_head_rewards() -> None:
             aux=torch.ones(n, 2, dtype=torch.int32),
         )
     buf.close()
+
+
+def test_without_next_obs_drops_only_the_next_groups() -> None:
+    schema = RowSchema(
+        obs_dim=_OBS_DIM,
+        action_dim=_ACTION_DIM,
+        critic_dim=_CRITIC_DIM,
+        reward_heads=2,
+        aux_width=2,
+        float_dtype="fp16",
+    )
+    ring = schema.without_next_obs()
+
+    assert ring.store_next_obs is False
+    assert not ring.has_field("next_obs")
+    assert not ring.has_field("next_critic")
+    for name in ("obs", "actions", "rewards", "dones", "truncated", "critic", "aux"):
+        assert ring.has_field(name)
+    assert ring.field("obs").offset == 0
+    # actions shift into the columns next_obs occupied before.
+    assert ring.field("actions").offset == _OBS_DIM
+    assert ring.field("actions").width == _ACTION_DIM
+    assert ring.field("critic").offset == 0
+    assert ring.field("critic").slab == 2
+    assert ring.storage_row_bytes == schema.storage_row_bytes - (_OBS_DIM + _CRITIC_DIM) * 2
+    # The source schema is unchanged.
+    assert schema.has_field("next_obs")
+    assert schema.store_next_obs is True
+
+
+def test_store_next_obs_flag_is_validated() -> None:
+    with pytest.raises(ValueError, match="store_next_obs"):
+        RowSchema(obs_dim=_OBS_DIM, action_dim=_ACTION_DIM, store_next_obs=1)  # type: ignore[arg-type]

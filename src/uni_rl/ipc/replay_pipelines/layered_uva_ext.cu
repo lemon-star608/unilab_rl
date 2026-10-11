@@ -15,7 +15,8 @@ __global__ void gather_rows_uva_kernel(
     char* __restrict__ dst,
     const int64_t* __restrict__ indices,
     int64_t num_indices,
-    int64_t row_bytes) {
+    int64_t row_bytes,
+    int64_t src_row_stride) {
   const int64_t chunks_per_row = (row_bytes + VEC - 1) / VEC;
   const int64_t total_chunks = num_indices * chunks_per_row;
   const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
@@ -25,7 +26,7 @@ __global__ void gather_rows_uva_kernel(
     const int64_t i = t / chunks_per_row;
     const int64_t c = t % chunks_per_row;
     const int64_t byte_off = c * VEC;
-    const char* s = src + indices[i] * row_bytes + byte_off;
+    const char* s = src + indices[i] * src_row_stride + byte_off;
     char* d = dst + i * row_bytes + byte_off;
     const int64_t n = (row_bytes - byte_off) < static_cast<int64_t>(VEC)
                           ? (row_bytes - byte_off)
@@ -50,6 +51,7 @@ __global__ void gather_rows_uva_kernel(
 
 void gather_rows_uva(
     std::uintptr_t src_host_ptr,
+    std::uintptr_t src_row_stride,
     torch::Tensor dst,
     torch::Tensor indices,
     std::uintptr_t stream_handle) {
@@ -66,6 +68,9 @@ void gather_rows_uva(
   const int64_t row_bytes = dst.size(1) * dst.element_size();
   if (row_bytes <= 0) {
     throw std::runtime_error("UVA gather destination rows must be non-empty");
+  }
+  if (src_row_stride < static_cast<std::uintptr_t>(row_bytes)) {
+    throw std::runtime_error("UVA gather source row stride is smaller than the row width");
   }
   const int64_t num_indices = indices.numel();
   if (num_indices == 0) {
@@ -92,14 +97,17 @@ void gather_rows_uva(
       grid = 65535;
     }
     gather_rows_uva_kernel<VEC><<<static_cast<unsigned int>(grid), block, 0, stream>>>(
-        src, dst_ptr, index_ptr, num_indices, row_bytes);
+        src, dst_ptr, index_ptr, num_indices, row_bytes,
+        static_cast<int64_t>(src_row_stride));
   };
 
-  // Widest aligned vector wins; rows start at base + idx * row_bytes, so both
+  // Widest aligned vector wins; rows start at base + idx * src_row_stride, so
   // the base pointer and the row stride must preserve the alignment.
   const bool aligned16 = (src_host_ptr % 16 == 0) && (row_bytes % 16 == 0) &&
+                         (src_row_stride % 16 == 0) &&
                          (reinterpret_cast<std::uintptr_t>(dst_ptr) % 16 == 0);
   const bool aligned4 = (src_host_ptr % 4 == 0) && (row_bytes % 4 == 0) &&
+                        (src_row_stride % 4 == 0) &&
                         (reinterpret_cast<std::uintptr_t>(dst_ptr) % 4 == 0);
   if (aligned16) {
     launch(std::integral_constant<int, 16>{});

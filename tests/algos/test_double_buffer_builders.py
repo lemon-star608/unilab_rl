@@ -758,3 +758,39 @@ def test_flashsac_builder_rejects_invalid_n_step(
     cfg.algo.algo_params.n_step = bad
     with pytest.raises(ValueError, match="n_step must be a positive integer"):
         _build_flashsac_runner(cfg)
+
+
+def test_flashsac_builder_wires_next_obs_reconstruction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uni_rl.algos.flash_sac.double_buffer as module
+    from uni_rl.algos.flash_sac.replay import LayeredAgeBiasedReplayPipeline
+
+    _patch_flashsac_builder(module, monkeypatch)
+
+    cfg = _flashsac_cfg()
+    cfg.algo.num_envs = 8
+    cfg.algo.algo_params.n_step = 5
+    cfg.algo.algo_params.replay_storage = "cpu_layered"
+    cfg.algo.algo_params.replay_reconstruct_next_obs = True
+    runner = _build_flashsac_runner(cfg)
+
+    assert runner.kwargs["reconstruct_next_obs"] is True
+    assert runner.kwargs["n_step"] == 5
+    factory = runner.kwargs["replay_pipeline_factory"]
+    assert factory.func is LayeredAgeBiasedReplayPipeline
+    assert factory.keywords["reconstruct_next_obs"] is True
+    assert factory.keywords["next_obs_alias_rows"] == 40
+
+
+def test_flashsac_builder_rejects_reconstruction_without_layered_storage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uni_rl.algos.flash_sac.double_buffer as module
+
+    _patch_flashsac_builder(module, monkeypatch)
+
+    cfg = _flashsac_cfg()
+    cfg.algo.algo_params.replay_reconstruct_next_obs = True
+    with pytest.raises(ValueError, match="cpu_layered"):
+        _build_flashsac_runner(cfg)

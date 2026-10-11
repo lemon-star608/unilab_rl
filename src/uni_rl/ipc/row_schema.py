@@ -95,7 +95,10 @@ class RowSchema:
         reward_heads: int = 1,
         aux_width: int = 0,
         float_dtype: str | torch.dtype = torch.float32,
+        store_next_obs: bool = True,
     ) -> None:
+        if not isinstance(store_next_obs, bool):
+            raise ValueError(f"store_next_obs must be boolean, got {store_next_obs!r}")
         for name, value in (
             ("obs_dim", obs_dim),
             ("action_dim", action_dim),
@@ -122,10 +125,11 @@ class RowSchema:
         self.reward_heads = reward_heads
         self.aux_width = aux_width
         self.float_dtype = resolve_float_dtype(float_dtype)
+        self.store_next_obs = store_next_obs
 
         widths: dict[str, int] = {
             "obs": obs_dim,
-            "next_obs": obs_dim,
+            "next_obs": obs_dim if store_next_obs else 0,
             "actions": action_dim,
             "rewards": reward_heads,
             "dones": 1,
@@ -134,7 +138,7 @@ class RowSchema:
         }
         if critic_dim > 0:
             widths["critic"] = critic_dim
-            widths["next_critic"] = critic_dim
+            widths["next_critic"] = critic_dim if store_next_obs else 0
         else:
             widths["critic"] = 0
             widths["next_critic"] = 0
@@ -219,6 +223,23 @@ class RowSchema:
             raise KeyError(f"Row field {name!r} is unavailable in this schema")
         return field
 
+    def without_next_obs(self) -> "RowSchema":
+        """Return the ring layout with the next_obs/next_critic groups dropped.
+
+        Used by the layered pipeline when next_obs is reconstructed by index:
+        the ring then stores each observation once while ingress and sampled
+        batches keep the full (dense) layout.
+        """
+        return RowSchema(
+            obs_dim=self.obs_dim,
+            action_dim=self.action_dim,
+            critic_dim=self.critic_dim,
+            reward_heads=self.reward_heads,
+            aux_width=self.aux_width,
+            float_dtype=self.float_dtype,
+            store_next_obs=False,
+        )
+
     def summary(self) -> dict[str, object]:
         """Config-serializable description persisted with run manifests."""
         return {
@@ -228,6 +249,7 @@ class RowSchema:
             "reward_heads": self.reward_heads,
             "aux_width": self.aux_width,
             "float_dtype": str(self.float_dtype).removeprefix("torch."),
+            "store_next_obs": self.store_next_obs,
             "storage_width": self._storage_width,
             "storage_row_bytes": self._storage_row_bytes,
             "slabs": [
@@ -239,3 +261,31 @@ class RowSchema:
                 for slab in self._slabs
             ],
         }
+
+
+def field_view(
+    packed: "torch.Tensor | list[torch.Tensor]",
+    schema: RowSchema,
+    field_name: str,
+) -> torch.Tensor:
+    """View one schema field of a packed payload in storage dtype.
+
+    ``rewards`` / ``dones`` / ``truncated`` are squeezed to 1-D when their
+    group holds a single column, preserving the historical view shapes.
+    """
+    field = schema.field(field_name)
+    view = field_columns(packed, schema, field_name)
+    if field.width == 1:
+        return view[:, 0]
+    return view
+
+
+def field_columns(
+    packed: "torch.Tensor | list[torch.Tensor]",
+    schema: RowSchema,
+    field_name: str,
+) -> torch.Tensor:
+    """Two-dimensional ``(rows, width)`` view of one schema field."""
+    field = schema.field(field_name)
+    slab = packed[field.slab] if isinstance(packed, list) else packed
+    return slab[:, field.offset : field.end]

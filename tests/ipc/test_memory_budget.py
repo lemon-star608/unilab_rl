@@ -467,3 +467,33 @@ def test_host_memory_gate_fails_closed_and_skips_without_meminfo(monkeypatch) ->
     monkeypatch.setattr(layered_module, "host_available_memory_bytes", lambda: None)
     with pytest.warns(UserWarning, match="budget check skipped"):
         raise_if_host_memory_over_budget({"total": 999 * 1024**3}, label="test")
+
+
+def test_budget_drops_next_obs_groups_for_reconstruction() -> None:
+    from uni_rl.ipc.row_schema import RowSchema
+
+    schema = RowSchema(obs_dim=8, action_dim=3, critic_dim=3, reward_heads=2, aux_width=2)
+    dense = estimate_offpolicy_bytes(
+        num_envs=4,
+        replay_buffer_n=8,
+        obs_dim=8,
+        action_dim=3,
+        critic_dim=3,
+        replay_storage_owner="cpu",
+        row_schema=schema,
+    )
+    recon = estimate_offpolicy_bytes(
+        num_envs=4,
+        replay_buffer_n=8,
+        obs_dim=8,
+        action_dim=3,
+        critic_dim=3,
+        replay_storage_owner="cpu",
+        row_schema=schema,
+        reconstruct_next_obs=True,
+    )
+    ring_schema = schema.without_next_obs()
+    assert recon["replay_buffer"] == 4 * 8 * ring_schema.storage_row_bytes
+    # Ingress slots stay dense; only the pinned ring shrinks.
+    assert recon["bounded_ingress_slots"] == dense["bounded_ingress_slots"]
+    assert recon["replay_buffer"] < dense["replay_buffer"]

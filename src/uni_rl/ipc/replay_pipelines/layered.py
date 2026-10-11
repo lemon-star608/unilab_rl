@@ -34,6 +34,7 @@ from uni_rl.ipc.replay_pipelines.gpu_resident import (
     require_offpolicy_replay_device,
 )
 from uni_rl.ipc.replay_pipelines.layered_uva import get_diagnostic, load_extension
+from uni_rl.ipc.row_schema import field_columns, field_view
 
 # cudaHostRegisterPortable | cudaHostRegisterMapped: the mapping makes the
 # host pages dereferenceable from device kernels (UVA) on every device.
@@ -83,6 +84,8 @@ class LayeredReplayPipeline:
         transport: str = "auto",
         sample_rebuilder: ReplaySampleRebuilder | None = None,
         copy_workers: int = 4,
+        reconstruct_next_obs: bool = False,
+        next_obs_alias_rows: int | None = None,
     ) -> None:
         self._replay_buffer = replay_buffer
         if transport not in ("auto", "uva", "h2d"):
@@ -103,16 +106,41 @@ class LayeredReplayPipeline:
         self._trace_recorder = trace_recorder
         self._trace_cuda_events = bool(trace_cuda_events)
         self._schema = replay_buffer.row_schema
-        self._slabs = self._schema.slabs
         self._capacity = int(replay_buffer.capacity)
-        self._storage_width = self._schema.storage_width
-        self._row_bytes = self._schema.storage_row_bytes
+        self._reconstruct_next_obs = bool(reconstruct_next_obs)
+        if self._reconstruct_next_obs:
+            if next_obs_alias_rows is None or next_obs_alias_rows <= 0:
+                raise ValueError(
+                    "next_obs_alias_rows (n_step * num_envs) must be positive "
+                    "when reconstruct_next_obs is enabled"
+                )
+            if next_obs_alias_rows >= self._capacity:
+                raise ValueError(
+                    f"replay capacity {self._capacity} must exceed the next_obs "
+                    f"alias span {next_obs_alias_rows} (n_step * num_envs)"
+                )
+            self._alias_rows = int(next_obs_alias_rows)
+            self._ring_schema = self._schema.without_next_obs()
+        else:
+            self._alias_rows = 0
+            self._ring_schema = self._schema
+        self._slabs = self._ring_schema.slabs
+        self._storage_width = self._ring_schema.storage_width
+        self._row_bytes = self._ring_schema.storage_row_bytes
+        self._dense_row_bytes = self._schema.storage_row_bytes
+        # Timeout rows (done & truncated) keep their true final observation in
+        # this sparse side table, keyed by absolute ring index and evicted as
+        # the ring overwrites rows. Done rows in general (terminated or
+        # truncated) are covered so reconstructed next_obs matches the dense
+        # storage's terminal patch bit for bit (uni_rl stores the final
+        # observation for every done row).
+        self._terminal_next_obs: dict[int, tuple[torch.Tensor, torch.Tensor | None]] = {}
         self._sample_rebuilder = sample_rebuilder
         self._copy_workers = max(1, int(copy_workers))
 
         # -- host RAM guard (hard fail: pinned pages are non-pageable) --
         storage_bytes = self._capacity * self._row_bytes
-        staging_bytes = 2 * self._sample_count * self._row_bytes
+        staging_bytes = 2 * self._sample_count * self._dense_row_bytes
         self._raise_if_host_over_budget(storage_bytes + staging_bytes)
 
         self._cudart: Any = torch.cuda.cudart()
@@ -127,22 +155,61 @@ class LayeredReplayPipeline:
         self._transport = self._resolve_transport(transport)
         try:
             self._host_slabs = self._allocate_host_slabs(self._capacity)
-            # Pinned staging slots for the H2D path (hot/cold double buffer).
-            self._staging_slabs = self._allocate_host_slabs(self._sample_count, count=2)
         except BaseException:
             self._unregister_all()
             raise
-        self._gpu_packed_slabs = [
-            [
+        # Batches are assembled per field: the same ring field feeds obs and
+        # (when reconstructing) next_obs with different index sets.
+        batch_fields = ["obs", "next_obs", "actions", "rewards", "dones", "truncated"]
+        if self._schema.critic_dim > 0:
+            batch_fields += ["critic", "next_critic"]
+        if self._schema.aux_width > 0:
+            batch_fields += ["aux"]
+        self._batch_fields = batch_fields
+        self._packed_fields = {
+            name: [
                 torch.empty(
-                    (self._sample_count, slab.width),
-                    dtype=slab.dtype,
+                    (self._sample_count, self._schema.field(name).width),
+                    dtype=self._schema.field(name).dtype,
                     device=self._device,
                 )
                 for _ in range(2)
             ]
-            for slab in self._slabs
+            for name in batch_fields
+        }
+        # Pinned staging slots for the H2D path (hot/cold double buffer).
+        try:
+            self._staging_fields = {
+                name: [
+                    self._allocate_pinned_tensor(
+                        self._sample_count,
+                        self._schema.field(name).width,
+                        self._schema.field(name).dtype,
+                    )
+                    for _ in range(2)
+                ]
+                for name in batch_fields
+            }
+        except BaseException:
+            self._unregister_all()
+            raise
+        # (batch field, ring field, gather with the alias index set)
+        reconstruct = self._reconstruct_next_obs
+        self._gather_plan: list[tuple[str, str, bool]] = [
+            ("obs", "obs", False),
+            ("next_obs", "obs" if reconstruct else "next_obs", reconstruct),
+            ("actions", "actions", False),
+            ("rewards", "rewards", False),
+            ("dones", "dones", False),
+            ("truncated", "truncated", False),
         ]
+        if self._schema.critic_dim > 0:
+            self._gather_plan += [
+                ("critic", "critic", False),
+                ("next_critic", "critic" if reconstruct else "next_critic", reconstruct),
+            ]
+        if self._schema.aux_width > 0:
+            self._gather_plan += [("aux", "aux", False)]
 
         self._gather_in_flight: Any | None = None
         self._copy_pool = ThreadPoolExecutor(
@@ -277,7 +344,13 @@ class LayeredReplayPipeline:
         src = torch.arange(64, dtype=torch.float32, pin_memory=True).reshape(8, 8)
         indices = torch.tensor([5, 1, 0], dtype=torch.int64, device=self._device)
         dst = torch.empty((3, 8), dtype=torch.float32, device=self._device)
-        ext.gather_rows_uva(int(src.data_ptr()), dst, indices, self._sync_stream.cuda_stream)
+        ext.gather_rows_uva(
+            int(src.data_ptr()),
+            int(src.stride(0) * src.element_size()),
+            dst,
+            indices,
+            self._sync_stream.cuda_stream,
+        )
         self._slot_events[0].record(self._sync_stream)
         self._slot_events[0].synchronize()
         expected = src[indices.cpu()].to(self._device)
@@ -375,7 +448,39 @@ class LayeredReplayPipeline:
             with self._prepare_condition:
                 self._visible_ptr = start + count
                 self._prepare_condition.notify_all()
+            if self._terminal_next_obs:
+                # Rows older than the current ring window can never be sampled
+                # again; their terminal entries are evicted (ring overwrite).
+                ring_start = self._visible_ptr - min(self._visible_ptr, self._capacity)
+                if ring_start > 0:
+                    for stale in [idx for idx in self._terminal_next_obs if idx < ring_start]:
+                        del self._terminal_next_obs[stale]
         return True
+
+    def _divert_terminal_rows(
+        self,
+        source_slabs: list[torch.Tensor],
+        start: int,
+        count: int,
+    ) -> None:
+        """Stash done rows' true final observations into the sparse table."""
+        dones = field_columns(source_slabs, self._schema, "dones")[:, 0]
+        done_mask = dones > 0.5
+        if not bool(done_mask.any()):
+            return
+        # The ingress slot's next_obs columns already carry the patched final
+        # observation (the buffer's terminal patch ran before publication).
+        next_obs = field_columns(source_slabs, self._schema, "next_obs")
+        next_critic = (
+            field_columns(source_slabs, self._schema, "next_critic")
+            if self._schema.critic_dim > 0
+            else None
+        )
+        for row in done_mask.nonzero().squeeze(-1).tolist():
+            self._terminal_next_obs[start + row] = (
+                next_obs[row].clone(),
+                next_critic[row].clone() if next_critic is not None else None,
+            )
 
     def _copy_span_to_ring(
         self,
@@ -384,16 +489,21 @@ class LayeredReplayPipeline:
         count: int,
     ) -> None:
         source_slabs = _as_slab_list(source)
+        if self._reconstruct_next_obs:
+            self._divert_terminal_rows(source_slabs, start, count)
+        ring_fields = [name for slab in self._ring_schema.slabs for name in slab.fields]
         if source_slabs[0].is_cuda:
             # GPU-centric ingress: D2H copy on the side stream, committed only
             # after the copy completes (pump thread blocks; spans are rare and
             # the bus is the limit anyway).
             with torch.cuda.stream(self._sync_stream):
-                for source_slab, host_slab in zip(source_slabs, self._host_slabs, strict=True):
+                for name in ring_fields:
+                    source_columns = field_columns(source_slabs, self._schema, name)
+                    host_columns = field_columns(self._host_slabs, self._ring_schema, name)
                     source_offset = 0
                     for offset, length in _ring_spans(start, start + count, self._capacity):
-                        host_slab[offset : offset + length].copy_(
-                            source_slab[source_offset : source_offset + length],
+                        host_columns[offset : offset + length].copy_(
+                            source_columns[source_offset : source_offset + length],
                             non_blocking=True,
                         )
                         source_offset += length
@@ -402,7 +512,9 @@ class LayeredReplayPipeline:
             done_event.synchronize()
             return
         futures = []
-        for source_slab, host_slab in zip(source_slabs, self._host_slabs, strict=True):
+        for name in ring_fields:
+            source_columns = field_columns(source_slabs, self._schema, name)
+            host_columns = field_columns(self._host_slabs, self._ring_schema, name)
             workers = min(self._copy_workers, count)
             bounds = [(index * count) // workers for index in range(workers + 1)]
             for chunk_index in range(workers):
@@ -413,8 +525,8 @@ class LayeredReplayPipeline:
                 futures.append(
                     self._copy_pool.submit(
                         self._copy_rows_wrapped,
-                        source_slab,
-                        host_slab,
+                        source_columns,
+                        host_columns,
                         start + row_lo,
                         start + row_hi,
                         row_lo,
@@ -425,71 +537,140 @@ class LayeredReplayPipeline:
 
     def _copy_rows_wrapped(
         self,
-        source_slab: torch.Tensor,
-        host_slab: torch.Tensor,
+        source_columns: torch.Tensor,
+        host_columns: torch.Tensor,
         abs_lo: int,
         abs_hi: int,
         source_offset: int,
     ) -> None:
         for offset, length in _ring_spans(abs_lo, abs_hi, self._capacity):
-            host_slab[offset : offset + length].copy_(
-                source_slab[source_offset : source_offset + length]
+            host_columns[offset : offset + length].copy_(
+                source_columns[source_offset : source_offset + length]
             )
             source_offset += length
 
     # -- sampling --------------------------------------------------------------
 
-    def _draw_indices(
+    def _draw_logical_indices(
         self,
         *,
-        visible_size: int,
+        domain: int,
         device: torch.device,
         generator: torch.Generator,
     ) -> torch.Tensor:
-        """Uniform physical row indices; subclasses may override the sampler."""
+        """Uniform logical indices over the sampling domain; subclasses may
+        override the sampler (age-biased variants draw logical indices too)."""
         return torch.randint(
             0,
-            visible_size,
+            domain,
             (self._sample_count,),
             generator=generator,
             device=device,
         )
 
-    def _sample_indices(self, *, visible_size: int, sample_seed: int) -> torch.Tensor:
+    def _sample_logical_indices(self, *, domain: int, sample_seed: int) -> torch.Tensor:
         index_device = self._device if self._transport == "uva" else torch.device("cpu")
         generator = torch.Generator(device=index_device)
         generator.manual_seed(sample_seed)
-        return self._draw_indices(
-            visible_size=visible_size,
+        return self._draw_logical_indices(
+            domain=domain,
             device=index_device,
             generator=generator,
         )
 
-    def _submit_gather(self, indices: torch.Tensor, *, slot: int) -> torch.Tensor:
-        """Submit the cold-slot gather; returns device-resident batch indices."""
+    def _to_physical_indices(
+        self,
+        logical: torch.Tensor,
+        *,
+        ring_start_abs: int,
+    ) -> torch.Tensor:
+        if ring_start_abs == 0:
+            return logical
+        return (ring_start_abs + logical) % self._capacity
+
+    def _submit_gather(
+        self,
+        logical: torch.Tensor,
+        *,
+        ring_start_abs: int,
+        slot: int,
+    ) -> torch.Tensor:
+        """Submit the cold-slot gather; returns device-resident absolute indices."""
+        physical = self._to_physical_indices(logical, ring_start_abs=ring_start_abs)
+        alias_physical = (
+            (physical + self._alias_rows) % self._capacity if self._reconstruct_next_obs else None
+        )
         with torch.cuda.stream(self._sync_stream):
-            if self._transport == "uva":
-                assert self._uva_ext is not None
-                for host_slab, packed_slabs in zip(
-                    self._host_slabs, self._gpu_packed_slabs, strict=True
-                ):
+            for batch_field, ring_field, use_alias in self._gather_plan:
+                field = self._ring_schema.field(ring_field)
+                ring_slab = self._host_slabs[field.slab]
+                indices = alias_physical if use_alias else physical
+                assert indices is not None
+                if self._transport == "uva":
+                    assert self._uva_ext is not None
                     self._uva_ext.gather_rows_uva(
-                        int(host_slab.data_ptr()),
-                        packed_slabs[slot],
+                        int(ring_slab.data_ptr()) + field.offset * ring_slab.element_size(),
+                        int(ring_slab.stride(0) * ring_slab.element_size()),
+                        self._packed_fields[batch_field][slot],
                         indices,
                         self._sync_stream.cuda_stream,
                     )
-                device_indices = indices
-            else:
-                for host_slab, staging_slabs, packed_slabs in zip(
-                    self._host_slabs, self._staging_slabs, self._gpu_packed_slabs, strict=True
-                ):
-                    torch.index_select(host_slab, 0, indices, out=staging_slabs[slot])
-                    packed_slabs[slot].copy_(staging_slabs[slot], non_blocking=True)
-                device_indices = indices.to(self._device, non_blocking=True)
+                else:
+                    torch.index_select(
+                        ring_slab[:, field.offset : field.end],
+                        0,
+                        indices,
+                        out=self._staging_fields[batch_field][slot],
+                    )
+                    self._packed_fields[batch_field][slot].copy_(
+                        self._staging_fields[batch_field][slot],
+                        non_blocking=True,
+                    )
+            if self._reconstruct_next_obs and self._terminal_next_obs:
+                self._patch_terminal_rows(logical, ring_start_abs=ring_start_abs, slot=slot)
             self._slot_events[slot].record(self._sync_stream)
         self._gather_in_flight = self._slot_events[slot]
-        return device_indices
+        abs_indices = ring_start_abs + logical
+        if abs_indices.device != self._device:
+            abs_indices = abs_indices.to(self._device, non_blocking=True)
+        return abs_indices
+
+    def _patch_terminal_rows(
+        self,
+        logical: torch.Tensor,
+        *,
+        ring_start_abs: int,
+        slot: int,
+    ) -> None:
+        """Patch timeout rows' true final observations back into the batch."""
+        dones = self._packed_fields["dones"][slot][:, 0]
+        mask = dones > 0.5
+        positions = mask.nonzero().squeeze(-1)
+        if positions.numel() == 0:
+            return
+        abs_indices = (ring_start_abs + logical.to(positions.device)[positions]).cpu().tolist()
+        obs_rows: list[torch.Tensor] = []
+        critic_rows: list[torch.Tensor] = []
+        has_critic = self._schema.critic_dim > 0
+        for abs_index in abs_indices:
+            entry = self._terminal_next_obs.get(int(abs_index))
+            if entry is None:
+                raise RuntimeError(
+                    "terminal next_obs table miss for replay row "
+                    f"{int(abs_index)} (reconstruction bookkeeping diverged)"
+                )
+            obs_rows.append(entry[0])
+            if has_critic:
+                assert entry[1] is not None
+                critic_rows.append(entry[1])
+        device_positions = positions.to(self._device)
+        self._packed_fields["next_obs"][slot][device_positions] = torch.stack(obs_rows).to(
+            self._device, non_blocking=True
+        )
+        if has_critic:
+            self._packed_fields["next_critic"][slot][device_positions] = torch.stack(
+                critic_rows
+            ).to(self._device, non_blocking=True)
 
     def _service_pending_prepare(self) -> bool:
         with self._prepare_condition:
@@ -498,16 +679,20 @@ class LayeredReplayPipeline:
             tick_id = self._prepare_tick_id
             required_ptr = self._prepare_required_ptr
             slot = self._cold
-        visible_size = min(self._visible_ptr, self._capacity)
-        if self._visible_ptr < required_ptr or visible_size <= 0:
+        full_visible = min(self._visible_ptr, self._capacity)
+        # The newest alias-span rows are not yet valid next_obs sources for
+        # their predecessors, so the sampling domain excludes them.
+        domain = full_visible - self._alias_rows
+        if self._visible_ptr < required_ptr or domain <= 0:
             return False
         sample_seed = self._base_seed + int(tick_id)
-        indices = self._sample_indices(visible_size=visible_size, sample_seed=sample_seed)
-        device_indices = self._submit_gather(indices, slot=slot)
+        logical = self._sample_logical_indices(domain=domain, sample_seed=sample_seed)
+        ring_start_abs = self._visible_ptr - full_visible
+        device_indices = self._submit_gather(logical, ring_start_abs=ring_start_abs, slot=slot)
         metadata = ReplayTickMetadata(
             tick_id=int(tick_id),
             snapshot_ptr=int(self._visible_ptr),
-            snapshot_size=visible_size,
+            snapshot_size=full_visible,
             sample_seed=sample_seed,
             sample_count=self._sample_count,
             batch_host_slot=None,
@@ -524,18 +709,18 @@ class LayeredReplayPipeline:
 
     def _read_batch_field(
         self,
-        packed: torch.Tensor | list[torch.Tensor],
+        packed: Dict[str, torch.Tensor],
         field_name: str,
     ) -> torch.Tensor:
-        view = self._replay_buffer.field_view(packed, field_name)
+        field = self._schema.field(field_name)
+        view = packed[field_name]
+        if field.width == 1:
+            view = view[:, 0]
         if view.is_floating_point() and view.dtype != torch.float32:
             return view.to(torch.float32)
         return view
 
-    def _packed_batch_view(
-        self, packed: torch.Tensor | list[torch.Tensor]
-    ) -> Dict[str, torch.Tensor]:
-        rb = self._replay_buffer
+    def _packed_batch_view(self, packed: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         batch = {
             "obs": self._read_batch_field(packed, "obs"),
             "next_obs": self._read_batch_field(packed, "next_obs"),
@@ -544,16 +729,15 @@ class LayeredReplayPipeline:
             "dones": self._read_batch_field(packed, "dones"),
             "truncated": self._read_batch_field(packed, "truncated"),
         }
-        if rb._critic_dim > 0:
+        if self._schema.critic_dim > 0:
             batch["critic"] = self._read_batch_field(packed, "critic")
             batch["next_critic"] = self._read_batch_field(packed, "next_critic")
-        if rb._schema.aux_width > 0:
+        if self._schema.aux_width > 0:
             batch["aux"] = self._read_batch_field(packed, "aux")
         return batch
 
-    def _packed_slot(self, slot: int) -> torch.Tensor | list[torch.Tensor]:
-        payloads = [slab_slots[slot] for slab_slots in self._gpu_packed_slabs]
-        return payloads[0] if len(payloads) == 1 else payloads
+    def _packed_slot(self, slot: int) -> Dict[str, torch.Tensor]:
+        return {name: slots[slot] for name, slots in self._packed_fields.items()}
 
     def _large_batch_view(self, slot: int) -> Dict[str, torch.Tensor]:
         return self._packed_batch_view(self._packed_slot(slot))
@@ -609,7 +793,7 @@ class LayeredReplayPipeline:
             index = field_start % self._capacity
             fields: dict[str, torch.Tensor] = {}
             for field_name in field_names:
-                source = self._replay_buffer.field_view(self._host_slabs, field_name)
+                source = field_view(self._host_slabs, self._ring_schema, field_name)
                 if index + count <= self._capacity:
                     fields[field_name] = source[index : index + count].clone()
                     continue
@@ -633,16 +817,16 @@ class LayeredReplayPipeline:
         index_device = self._device if self._transport == "uva" else torch.device("cpu")
         generator = torch.Generator(device=index_device)
         generator.manual_seed(self._base_seed - 1)
-        visible_size = min(self._capacity, max(1, self._sample_count))
-        indices = self._draw_indices(
-            visible_size=visible_size,
+        domain = max(1, min(self._capacity, max(1, self._sample_count)) - self._alias_rows)
+        logical = self._draw_logical_indices(
+            domain=domain,
             device=index_device,
             generator=generator,
         )
-        self._submit_gather(indices, slot=slot)
+        self._submit_gather(logical, ring_start_abs=0, slot=slot)
         self._slot_events[slot].synchronize()
-        for packed_slab in _as_slab_list(self._packed_slot(slot)):
-            packed_slab.zero_()
+        for packed_tensor in self._packed_slot(slot).values():
+            packed_tensor.zero_()
         self._gather_in_flight = None
         return self._large_batch_view(slot)
 
@@ -787,7 +971,8 @@ class LayeredReplayPipeline:
                 event.synchronize()
             except Exception:
                 pass
-        self._gpu_packed_slabs.clear()
-        self._staging_slabs.clear()
+        self._packed_fields.clear()
+        self._staging_fields.clear()
+        self._terminal_next_obs.clear()
         self._host_slabs.clear()
         self._unregister_all()

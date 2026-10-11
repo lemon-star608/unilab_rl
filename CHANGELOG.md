@@ -59,6 +59,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   honored), and the reward normalizer keeps tracking *raw* per-step returns
   through a bounded shared `RawRewardStatsRing` drained once per iteration
   (overflow drops are counted, never blocking collection).
+- next_obs by-index reconstruction for the CPU-layered replay
+  (`algo.algo_params.replay_reconstruct_next_obs`, default `false`, behavior
+  unchanged). The ring drops the `next_obs`/`next_critic` groups
+  (`RowSchema.without_next_obs`), sampled batches rebuild them from
+  `obs[idx + n_step * num_envs]`, the sampling domain excludes the newest
+  alias span, and done rows' true final observations ride a sparse terminal
+  table (keyed by ring index, evicted on ring overwrite) so reconstructed
+  batches match the dense path bit for bit. Measured: ~x1.9 smaller pinned
+  storage at ~neutral sampling bandwidth (the alias gather reads the obs
+  group twice per sampled row).
 
 ## [1.4.11] - 2026-10-09
 

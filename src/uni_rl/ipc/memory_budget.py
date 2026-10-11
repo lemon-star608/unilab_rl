@@ -165,6 +165,7 @@ def estimate_offpolicy_bytes(
     ingress_on_device: bool = False,
     row_schema: "RowSchema | None" = None,
     replay_storage_owner: str = "gpu",
+    reconstruct_next_obs: bool = False,
 ) -> dict[str, int | str]:
     """Estimate host shared memory for bounded off-policy replay ingress.
 
@@ -205,11 +206,17 @@ def estimate_offpolicy_bytes(
         raise ValueError("inference_ring_bytes must be a non-negative integer")
     row_width = 2 * obs_dim + action_dim + 3 + 2 * critic_dim
     row_bytes = row_width * 4 if row_schema is None else row_schema.storage_row_bytes
+    ring_row_bytes = row_bytes
+    if reconstruct_next_obs:
+        # The ring drops the next_obs/next_critic groups (index reconstruction
+        # aliases them from obs/critic rows); ingress slots stay dense.
+        element_size = 4 if row_schema is None else int(row_schema.float_dtype.itemsize)
+        ring_row_bytes = row_bytes - (obs_dim + critic_dim) * element_size
     capacity = replay_buffer_n * num_envs
     ingress_bytes = (
         0 if ingress_on_device else ingress_depth * effective_ingress_slot_rows * row_bytes
     )
-    pinned_replay_bytes = capacity * row_bytes if replay_storage_owner == "cpu" else 0
+    pinned_replay_bytes = capacity * ring_row_bytes if replay_storage_owner == "cpu" else 0
     inference_ring_line = (
         f"  Inference ring: {inference_ring_bytes / 1024**2:.0f} MB\n"
         if inference_ring_bytes
@@ -217,7 +224,7 @@ def estimate_offpolicy_bytes(
     )
     replay_line = (
         f"Replay: {pinned_replay_bytes / 1024**2:.0f} MB pinned host storage "
-        f"({capacity} rows × {row_bytes} B, CPU-layered owner)\n"
+        f"({capacity} rows × {ring_row_bytes} B, CPU-layered owner)\n"
         if replay_storage_owner == "cpu"
         else (
             "Replay: 0 MB shared host memory "

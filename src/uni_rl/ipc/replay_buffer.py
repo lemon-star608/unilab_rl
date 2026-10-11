@@ -7,6 +7,7 @@ from typing import Any
 import torch
 
 from uni_rl.ipc.row_schema import RowSchema
+from uni_rl.ipc.row_schema import field_view as schema_field_view
 from uni_rl.ipc.shared_buffer import SharedBufferBase
 
 DEFAULT_REPLAY_INGRESS_DEPTH = 2
@@ -668,23 +669,17 @@ class ReplayBuffer(SharedBufferBase):
         if not torch.any(terminal_mask):
             return
 
-        target_next_obs[terminal_mask] = terminal_next_obs[terminal_mask]
+        target_next_obs[terminal_mask] = terminal_next_obs[terminal_mask].to(target_next_obs.dtype)
 
         if target_next_critic is not None and terminal_next_critic is not None:
-            target_next_critic[terminal_mask] = terminal_next_critic[terminal_mask]
+            target_next_critic[terminal_mask] = terminal_next_critic[terminal_mask].to(
+                target_next_critic.dtype
+            )
 
     def field_view(
         self,
         packed: torch.Tensor | list[torch.Tensor],
         field_name: str,
     ) -> torch.Tensor:
-        """View one row-schema field of a packed payload in storage dtype.
-
-        ``rewards`` / ``dones`` / ``truncated`` are squeezed to 1-D when their
-        group holds a single column, preserving the historical view shapes.
-        """
-        field = self._schema.field(field_name)
-        slab = _as_slab_list(packed)[field.slab]
-        if field.width == 1:
-            return slab[:, field.offset]
-        return slab[:, field.offset : field.end]
+        """View one row-schema field of a packed payload in storage dtype."""
+        return schema_field_view(packed, self._schema, field_name)

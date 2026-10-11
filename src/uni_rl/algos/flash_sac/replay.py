@@ -159,17 +159,19 @@ class LayeredAgeBiasedReplayPipeline(LayeredReplayPipeline):
             raise ValueError(f"num_buckets must be non-negative, got {self.num_buckets}")
         super().__init__(replay_buffer, **kwargs)
 
-    def _draw_indices(
+    def _draw_logical_indices(
         self,
         *,
-        visible_size: int,
+        domain: int,
         device: torch.device,
         generator: torch.Generator,
     ) -> torch.Tensor:
+        # capacity/current_ptr pinned to the domain keeps the sampler in
+        # logical space; the pipeline maps logical -> physical ring rows.
         return biased_replay_indices(
-            visible_size=visible_size,
-            capacity=self._capacity,
-            current_ptr=int(self._visible_ptr),
+            visible_size=domain,
+            capacity=domain,
+            current_ptr=domain,
             sample_count=self._sample_count,
             decay_step=self.decay_step,
             min_weight=self.min_weight,

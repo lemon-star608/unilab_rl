@@ -280,3 +280,240 @@ class TestLayeredReplayPipeline:
         assert batch["rewards"].shape == (16,)
         assert batch["obs"].shape == (16, _OBS_DIM)
         rb.close()
+
+
+@cuda_only
+class TestLayeredNextObsReconstruction:
+    """Dense-vs-reconstructed next_obs parity (folded rows, terminal table)."""
+
+    _M = 4
+    _OBS = 8
+    _ACT = 3
+    _CRITIC = 2
+    _HEADS = 2
+    _AUX = 2
+    _N_STEP = 2
+    _T = 24
+
+    def _schema(self) -> RowSchema:
+        return RowSchema(
+            obs_dim=self._OBS,
+            action_dim=self._ACT,
+            critic_dim=self._CRITIC,
+            reward_heads=self._HEADS,
+            aux_width=self._AUX,
+            float_dtype="fp16",
+        )
+
+    def _folded_rows(self) -> list[dict]:
+        from uni_rl.offpolicy.n_step import NStepRewardFold
+
+        m, obs, act, critic, heads, aux = (
+            self._M,
+            self._OBS,
+            self._ACT,
+            self._CRITIC,
+            self._HEADS,
+            self._AUX,
+        )
+        folder = NStepRewardFold(self._N_STEP, 0.98)
+        rows = []
+        for t in range(self._T):
+            base = float(t)
+            obs_t = torch.full((m, obs), base) + torch.arange(m).unsqueeze(1) * 0.01
+            nobs_t = torch.full((m, obs), base + 1) + torch.arange(m).unsqueeze(1) * 0.01
+            dones = torch.zeros(m)
+            truncated = torch.zeros(m)
+            if t == 5:
+                dones[1] = 1.0
+            if t == 9:
+                dones[2] = 1.0
+                truncated[2] = 1.0
+            mask = dones > 0.5
+            row = folder.push(
+                {
+                    "obs": obs_t,
+                    "actions": torch.full((m, act), base + 0.5),
+                    "rewards": torch.full((m, heads), base + 0.25),
+                    "next_obs": nobs_t,
+                    "dones": dones,
+                    "truncated": truncated,
+                    "terminal_mask": mask,
+                    "terminal_next_obs": (
+                        torch.full((m, obs), base + 5000) if mask.any() else None
+                    ),
+                    "critic": torch.full((m, critic), base + 0.7),
+                    "next_critic": torch.full((m, critic), base + 1.7),
+                    "terminal_next_critic": (
+                        torch.full((m, critic), base + 5000.7) if mask.any() else None
+                    ),
+                    "aux": torch.full((m, aux), t, dtype=torch.int32),
+                }
+            )
+            if row is not None:
+                rows.append(row)
+        return rows
+
+    def _make(
+        self, rows: list[dict], *, reconstruct: bool, transport: str, capacity: int | None = None
+    ):
+        schema = self._schema()
+        total = len(rows) * self._M
+        rb = ReplayBuffer(
+            capacity=capacity or total,
+            obs_dim=schema.obs_dim,
+            action_dim=schema.action_dim,
+            device="cuda",
+            critic_dim=schema.critic_dim,
+            ingress_slot_rows=self._M,
+            row_schema=schema,
+        )
+        pipeline = LayeredReplayPipeline(
+            rb,
+            device="cuda",
+            sample_count=16,
+            base_seed=0,
+            transport=transport,
+            reconstruct_next_obs=reconstruct,
+            next_obs_alias_rows=self._N_STEP * self._M if reconstruct else None,
+        )
+        self._pipelines.append(pipeline)
+        for row in rows:
+            assert rb.add(
+                row["obs"],
+                row["actions"],
+                row["rewards"],
+                row["next_obs"],
+                row["dones"],
+                row["truncated"],
+                terminal_mask=row["terminal_mask"],
+                terminal_next_obs=row["terminal_next_obs"],
+                critic=row["critic"],
+                next_critic=row["next_critic"],
+                terminal_next_critic=row["terminal_next_critic"],
+                aux=row["aux"],
+            )
+        _wait_visible(pipeline, len(rows) * self._M)
+        return rb, pipeline
+
+    @pytest.fixture(autouse=True)
+    def _cleanup(self):
+        self._pipelines = []
+        yield
+        for pipeline in self._pipelines:
+            pipeline.close()
+
+    @staticmethod
+    def _gather(pipe, logical):
+        pipe._submit_gather(
+            logical,
+            ring_start_abs=pipe._visible_ptr - min(pipe._visible_ptr, pipe._capacity),
+            slot=0,
+        )
+        pipe._slot_events[0].synchronize()
+        return pipe._large_batch_view(0)
+
+    @pytest.mark.parametrize("transport", ["uva", "h2d"])
+    def test_reconstruct_matches_dense_bitwise(self, transport: str) -> None:
+        rows = self._folded_rows()
+        total = len(rows) * self._M
+        _, dense = self._make(rows, reconstruct=False, transport=transport)
+        _, recon = self._make(rows, reconstruct=True, transport=transport)
+        index_device = "cuda" if transport == "uva" else "cpu"
+        logical = torch.arange(16, dtype=torch.int64, device=index_device) % (
+            total - self._N_STEP * self._M
+        )
+
+        dense_batch = self._gather(dense, logical)
+        recon_batch = self._gather(recon, logical)
+        assert set(dense_batch) == set(recon_batch)
+        for key in dense_batch:
+            assert torch.equal(dense_batch[key], recon_batch[key]), key
+
+        assert recon._row_bytes < dense._row_bytes
+        # Done rows (terminated and timeout) populated the terminal table.
+        assert (5 * self._M + 1) in recon._terminal_next_obs
+        assert (9 * self._M + 2) in recon._terminal_next_obs
+
+    @pytest.mark.parametrize("transport", ["uva", "h2d"])
+    def test_reconstruct_matches_dense_across_ring_wrap(self, transport: str) -> None:
+        rows = self._folded_rows()
+        total = len(rows) * self._M
+        capacity = total - 6 * self._M  # wrap: step-5's done row is evicted
+        _, dense = self._make(rows, reconstruct=False, transport=transport, capacity=capacity)
+        _, recon = self._make(rows, reconstruct=True, transport=transport, capacity=capacity)
+        index_device = "cuda" if transport == "uva" else "cpu"
+        full_visible = min(dense._visible_ptr, dense._capacity)
+        domain = full_visible - self._N_STEP * self._M
+        logical = torch.arange(16, dtype=torch.int64, device=index_device) % domain
+
+        dense_batch = self._gather(dense, logical)
+        recon_batch = self._gather(recon, logical)
+        for key in dense_batch:
+            assert torch.equal(dense_batch[key], recon_batch[key]), key
+        # The evicted done row (step 5, outside the window) left the table.
+        assert (5 * self._M + 1) not in recon._terminal_next_obs
+        # The timeout row (step 9) is still inside the window and patched.
+        assert (9 * self._M + 2) in recon._terminal_next_obs
+        dones = recon_batch["dones"]
+        assert bool((dones > 0.5).any())
+
+    def test_sampling_domain_excludes_alias_span(self) -> None:
+        rows = self._folded_rows()[: self._N_STEP + 2]  # visible = alias + 2 steps
+        _, pipe = self._make(rows, reconstruct=True, transport="uva")
+        batch = pipe.sample_large_batch(0, 16)
+        # aux holds the folded-row step index; sampled rows must all be < 2.
+        assert int(batch["aux"][:, 0].max()) < 2
+
+    def test_domain_zero_never_becomes_ready(self) -> None:
+        rows = self._folded_rows()[: self._N_STEP]  # visible == alias span
+        _, pipe = self._make(
+            rows,
+            reconstruct=True,
+            transport="uva",
+            capacity=(self._N_STEP + 1) * self._M,
+        )
+        assert pipe.start_prepare(0, 16) is True
+        time.sleep(0.3)
+        assert pipe.batch_ready(0, 16) is False
+
+    def test_warmup_with_reconstruction(self) -> None:
+        rows = self._folded_rows()[:4]
+        _, pipe = self._make(rows, reconstruct=True, transport="uva")
+        batch = pipe.warmup()
+        assert batch["obs"].shape == (16, self._OBS)
+        assert batch["next_obs"].dtype == torch.float32
+
+    @pytest.mark.parametrize(
+        ("alias", "match"),
+        [(None, "must be positive"), (0, "must be positive"), (-4, "must be positive")],
+    )
+    def test_reconstruct_validates_alias_rows(self, alias: int | None, match: str) -> None:
+        rb = _make_replay()
+        with pytest.raises(ValueError, match=match):
+            LayeredReplayPipeline(
+                rb,
+                device="cuda",
+                sample_count=4,
+                reconstruct_next_obs=True,
+                next_obs_alias_rows=alias,
+            )
+
+    def test_reconstruct_rejects_capacity_within_alias_span(self) -> None:
+        rb = ReplayBuffer(
+            capacity=8,
+            obs_dim=self._OBS,
+            action_dim=self._ACT,
+            device="cuda",
+            critic_dim=self._CRITIC,
+            ingress_slot_rows=4,
+            row_schema=self._schema(),
+        )
+        with pytest.raises(ValueError, match="must exceed"):
+            LayeredReplayPipeline(
+                rb,
+                device="cuda",
+                sample_count=4,
+                reconstruct_next_obs=True,
+                next_obs_alias_rows=8,
+            )

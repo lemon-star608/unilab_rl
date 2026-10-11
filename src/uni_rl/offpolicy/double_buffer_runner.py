@@ -193,6 +193,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         row_schema: RowSchema | None = None,
         replay_storage_owner: str = "gpu",
         n_step: int = 1,
+        reconstruct_next_obs: bool = False,
         target_frequency: int = 1,
         policy_before_critic: bool = False,
         inference_placement: InferencePlacement | None = None,
@@ -376,6 +377,14 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         if isinstance(n_step, bool) or not isinstance(n_step, int) or n_step < 1:
             raise ValueError(f"n_step must be a positive integer, got {n_step!r}")
         self.n_step = n_step
+        if not isinstance(reconstruct_next_obs, bool):
+            raise ValueError(f"reconstruct_next_obs must be boolean, got {reconstruct_next_obs!r}")
+        if reconstruct_next_obs and replay_storage_owner != "cpu":
+            raise ValueError(
+                "reconstruct_next_obs requires the CPU-layered replay storage owner "
+                f"(replay_storage_owner='cpu'), got {replay_storage_owner!r}"
+            )
+        self.reconstruct_next_obs = reconstruct_next_obs
         # With collector-side n-step folding, replay rows carry folded rewards;
         # the learner normalizer tracks raw per-step returns through a dedicated
         # shared ring (created only when there is a normalizer to feed).
@@ -1500,6 +1509,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             ingress_on_device=gpu_centric_collector,
             row_schema=self.row_schema,
             replay_storage_owner=self.replay_storage_owner,
+            reconstruct_next_obs=self.reconstruct_next_obs,
         )
         warn_if_over_budget(mem_est, label=f"Off-policy ({self.algo_type})")
         raise_if_shared_memory_over_budget(mem_est, label=f"Off-policy ({self.algo_type})")

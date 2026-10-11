@@ -95,9 +95,18 @@ def _measure_pipelined(pipeline: LayeredReplayPipeline, iterations: int) -> floa
     return iterations * _SAMPLE_COUNT / (time.perf_counter() - start)
 
 
-def _run_config(name: str, schema_kwargs: dict, capacity: int, transports: list[str]) -> None:
+def _run_config(
+    name: str,
+    schema_kwargs: dict,
+    capacity: int,
+    transports: list[str],
+    *,
+    reconstruct: bool = False,
+) -> None:
     schema = RowSchema(**schema_kwargs, float_dtype="fp16")
-    row_bytes = schema.storage_row_bytes
+    row_bytes = (
+        schema.storage_row_bytes if not reconstruct else schema.without_next_obs().storage_row_bytes
+    )
     gib = capacity * row_bytes / 2**30
     print(f"\n=== {name}: {capacity / 1e6:.1f}M rows x {row_bytes}B = {gib:.2f} GiB pinned ===")
     rb = ReplayBuffer(
@@ -117,6 +126,8 @@ def _run_config(name: str, schema_kwargs: dict, capacity: int, transports: list[
             sample_count=_SAMPLE_COUNT,
             base_seed=0,
             transport=transport,
+            reconstruct_next_obs=reconstruct,
+            next_obs_alias_rows=(5 * 4096) if reconstruct else None,
         )
         fill_s = _fill_ring(rb, schema, capacity)
         visible = _drain_visible(pipeline, capacity)
@@ -159,7 +170,18 @@ def _run_config(name: str, schema_kwargs: dict, capacity: int, transports: list[
 
 def test_layered_replay_supply_rate_10m() -> None:
     transports = ["uva", "h2d"]
-    _run_config("FDR-iso dense (1712B rows)", _ISO, capacity=10_000_000, transports=transports)
+    _run_config("FDR-iso dense (1640B rows)", _ISO, capacity=10_000_000, transports=transports)
     _run_config(
         "FDR full-dims dense (3256B rows)", _FULL, capacity=5_000_000, transports=transports
+    )
+    # Reconstructed next_obs: the ring drops next_obs/next_critic (868B/row
+    # vs 1640B dense, x1.89 capacity saving). Bus traffic is ~neutral: the
+    # alias gather reads the obs group twice per sampled row, so supply
+    # (rows/s) is expected to match the dense path within overhead.
+    _run_config(
+        "FDR-iso reconstruct next_obs (868B rows)",
+        _ISO,
+        capacity=10_000_000,
+        transports=transports,
+        reconstruct=True,
     )

@@ -216,6 +216,11 @@ def build_flashsac_double_buffer_runner(
                 "algo.algo_params.replay_sample_rebuilder requires replay_storage='cpu_layered'"
             )
         sample_rebuilder = resolve_dotted_callable(str(rebuilder_path))
+    reconstruct_next_obs = bool(_algo_param(cfg.algo, "replay_reconstruct_next_obs", False))
+    if reconstruct_next_obs and replay_storage != "cpu_layered":
+        raise ValueError(
+            "algo.algo_params.replay_reconstruct_next_obs requires replay_storage='cpu_layered'"
+        )
 
     if custom_runtime is not None and custom_runtime.replay_pipeline_factory is not None:
         if replay_storage != "gpu":
@@ -234,6 +239,12 @@ def build_flashsac_double_buffer_runner(
             num_buckets=int(_algo_param(cfg.algo, "replay_num_buckets", 2000)),
             transport=layered_transport,
             sample_rebuilder=sample_rebuilder,
+            reconstruct_next_obs=reconstruct_next_obs,
+            next_obs_alias_rows=(
+                int(cfg.algo.algo_params.n_step) * int(cfg.algo.num_envs)
+                if reconstruct_next_obs
+                else None
+            ),
         )
         replay_storage_owner = "cpu"
     else:
@@ -285,5 +296,6 @@ def build_flashsac_double_buffer_runner(
         row_schema=row_schema,
         replay_storage_owner=replay_storage_owner,
         n_step=int(cfg.algo.algo_params.n_step),
+        reconstruct_next_obs=reconstruct_next_obs,
         replay_pipeline_factory=replay_pipeline_factory,
     )
