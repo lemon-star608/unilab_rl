@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import warnings
 from typing import TYPE_CHECKING
 
 from uni_rl.ipc.inference_ring import estimate_inference_ring_bytes
@@ -163,8 +164,18 @@ def estimate_offpolicy_bytes(
     inference_ring_bytes: int = 0,
     ingress_on_device: bool = False,
     row_schema: "RowSchema | None" = None,
+    replay_storage_owner: str = "gpu",
 ) -> dict[str, int | str]:
-    """Estimate host shared memory for bounded off-policy replay ingress."""
+    """Estimate host shared memory for bounded off-policy replay ingress.
+
+    With a CPU-pinned (layered) replay storage owner the authoritative ring is
+    accounted as host pinned bytes; the device-resident owner keeps the
+    historical zero host share.
+    """
+    if replay_storage_owner not in ("gpu", "cpu"):
+        raise ValueError(
+            f"replay_storage_owner must be 'gpu' or 'cpu', got {replay_storage_owner!r}"
+        )
     if not isinstance(ingress_on_device, bool):
         raise TypeError("ingress_on_device must be boolean")
     integer_values = (num_envs, replay_buffer_n, obs_dim, action_dim, critic_dim, ingress_depth)
@@ -198,22 +209,31 @@ def estimate_offpolicy_bytes(
     ingress_bytes = (
         0 if ingress_on_device else ingress_depth * effective_ingress_slot_rows * row_bytes
     )
+    pinned_replay_bytes = capacity * row_bytes if replay_storage_owner == "cpu" else 0
     inference_ring_line = (
         f"  Inference ring: {inference_ring_bytes / 1024**2:.0f} MB\n"
         if inference_ring_bytes
         else ""
     )
+    replay_line = (
+        f"Replay: {pinned_replay_bytes / 1024**2:.0f} MB pinned host storage "
+        f"({capacity} rows × {row_bytes} B, CPU-layered owner)\n"
+        if replay_storage_owner == "cpu"
+        else (
+            "Replay: 0 MB shared host memory "
+            f"({capacity} rows remain authoritative on the learner device)\n"
+        )
+    )
     return {
-        "replay_buffer": 0,
+        "replay_buffer": pinned_replay_bytes,
         "bounded_ingress_slots": ingress_bytes,
         "ingress_slot_rows": effective_ingress_slot_rows,
         "row_width": row_width,
         "inference_ring": int(inference_ring_bytes),
-        "total": ingress_bytes + int(inference_ring_bytes),
+        "total": pinned_replay_bytes + ingress_bytes + int(inference_ring_bytes),
         "breakdown": (
-            "Replay: 0 MB shared host memory "
-            f"({capacity} rows remain authoritative on the learner device)\n"
-            "  Bounded ingress: "
+            replay_line
+            + "  Bounded ingress: "
             + (
                 "0 MB (device-resident)\n"
                 if ingress_on_device
@@ -245,13 +265,20 @@ def estimate_cuda_tensor_runtime_bytes(
     collector_tensor_native: bool,
     persistent_exploration_scratch: int = 0,
     row_schema: "RowSchema | None" = None,
+    replay_storage_owner: str = "gpu",
 ) -> dict[str, int | str]:
     """Conservatively pre-flight all startup CUDA tensor-runtime allocations.
 
     The replay pipeline retains a second allocation guard after construction. This
     estimate deliberately runs before ingress, ring, replay storage, and batch
     tensors exist so an impossible combination cannot strand CUDA IPC resources.
+    With a CPU-pinned (layered) replay owner the authoritative ring is accounted
+    on the host, not here; learner batch slots stay on device.
     """
+    if replay_storage_owner not in ("gpu", "cpu"):
+        raise ValueError(
+            f"replay_storage_owner must be 'gpu' or 'cpu', got {replay_storage_owner!r}"
+        )
     replay_values = (
         num_envs,
         replay_buffer_n,
@@ -285,7 +312,7 @@ def estimate_cuda_tensor_runtime_bytes(
     row_width = 2 * obs_dim + action_dim + 3 + 2 * critic_dim
     row_bytes = row_width * 4 if row_schema is None else row_schema.storage_row_bytes
     replay_capacity = replay_buffer_n * num_envs
-    replay_storage = replay_capacity * row_bytes
+    replay_storage = replay_capacity * row_bytes if replay_storage_owner == "gpu" else 0
     learner_batch_slots = 2 * sample_count * row_bytes
     replay_ingress = (
         replay_ingress_depth * replay_ingress_slot_rows * row_bytes
@@ -298,11 +325,19 @@ def estimate_cuda_tensor_runtime_bytes(
         CUDA_TENSOR_RUNTIME_MIN_OVERHEAD_BYTES,
     )
     total = int(inference["total"]) + replay_exact + replay_overhead
-    lines = (
-        "CUDA tensor-runtime budget (conservative pre-flight):\n"
+    storage_line = (
         f"  Replay storage: {replay_storage / 1024**2:.1f} MB "
         f"({replay_capacity} rows × {row_bytes} B)\n"
-        f"  Learner double-buffer batches: {learner_batch_slots / 1024**2:.1f} MB "
+        if replay_storage_owner == "gpu"
+        else (
+            "  Replay storage: 0.0 MB on device "
+            f"({replay_capacity} rows × {row_bytes} B pinned on host, CPU-layered owner)\n"
+        )
+    )
+    lines = (
+        "CUDA tensor-runtime budget (conservative pre-flight):\n"
+        + storage_line
+        + f"  Learner double-buffer batches: {learner_batch_slots / 1024**2:.1f} MB "
         f"(2 slots × {sample_count} rows × {row_bytes} B)\n"
         f"  CUDA replay ingress: {replay_ingress / 1024**2:.1f} MB "
         f"({replay_ingress_depth} × {replay_ingress_slot_rows} rows; "
@@ -405,6 +440,47 @@ def raise_if_shared_memory_over_budget(
         f"{label}: estimated shared-memory allocation {est_gb:.1f} GB exceeds "
         f"{path} available {avail_gb:.1f} GB ({ratio:.0%} usage). "
         "Reduce algo.num_envs or algo.replay_buffer_n, or increase /dev/shm."
+    )
+
+
+def raise_if_host_memory_over_budget(
+    estimated: dict[str, int | str],
+    label: str,
+    threshold: float = 0.8,
+) -> None:
+    """Fail closed before pinning host memory beyond available RAM.
+
+    Pinned (page-locked) pages are non-reclaimable, so overcommitting them can
+    stall the whole host — the same severity class as VRAM overcommit, which
+    already hard-fails. Unlike the pageable host estimate (warn-only), the
+    CPU-layered replay pool is therefore gated against MemAvailable. Platforms
+    without a readable /proc/meminfo skip the check; cudaHostRegister remains
+    the fail-closed gate of last resort there.
+    """
+    from uni_rl.ipc.replay_pipelines.layered import host_available_memory_bytes
+
+    available = host_available_memory_bytes()
+    if available is None:
+        warnings.warn(
+            f"{label}: host RAM budget check skipped (/proc/meminfo unreadable); "
+            "cudaHostRegister remains the fail-closed gate.",
+            stacklevel=2,
+        )
+        return
+
+    total = int(estimated["total"])
+    ratio = total / max(available, 1)
+    if total <= available * threshold:
+        return
+
+    est_gb = total / 1024**3
+    avail_gb = available / 1024**3
+    raise MemoryError(
+        f"{label}: estimated host RAM allocation {est_gb:.1f} GB "
+        f"(pinned replay + bounded ingress + inference ring) exceeds "
+        f"{threshold:.0%} of MemAvailable {avail_gb:.1f} GB ({ratio:.0%} usage). "
+        "Reduce algo.num_envs or algo.replay_buffer_n, or shrink the replay row "
+        "(fp16 storage, critic:0, next_obs reconstruction)."
     )
 
 

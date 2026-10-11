@@ -11,13 +11,17 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 
 from uni_rl.algos.flash_sac.learner import FlashSACLearner
-from uni_rl.algos.flash_sac.replay import AgeBiasedReplayPipeline
+from uni_rl.algos.flash_sac.replay import AgeBiasedReplayPipeline, LayeredAgeBiasedReplayPipeline
 from uni_rl.env_contract import EnvFactory
 from uni_rl.ipc.replay_pipelines.gpu_resident import require_offpolicy_replay_device
 from uni_rl.ipc.row_schema import RowSchema
 from uni_rl.offpolicy.actor_adapter import import_actor_adapter_modules
 from uni_rl.offpolicy.double_buffer_runner import DoubleBufferOffPolicyRunner
-from uni_rl.offpolicy.runtime import resolve_actor_adapter_modules, resolve_custom_offpolicy_runtime
+from uni_rl.offpolicy.runtime import (
+    resolve_actor_adapter_modules,
+    resolve_custom_offpolicy_runtime,
+    resolve_dotted_callable,
+)
 from uni_rl.utils.device import get_default_device
 from uni_rl.utils.nan_guard import NanGuardCfg
 from uni_rl.utils.observations import get_obs_dims
@@ -191,14 +195,54 @@ def build_flashsac_double_buffer_runner(
     learner_kwargs.update(learner_extra_kwargs)
     learner = learner_cls(device=device, **learner_kwargs)
 
-    replay_pipeline_factory: Callable[..., Any] = partial(
-        AgeBiasedReplayPipeline,
-        decay_step=int(_algo_param(cfg.algo, "decay_step", 0)),
-        min_weight=float(_algo_param(cfg.algo, "replay_min_weight", 0.1)),
-        num_buckets=int(_algo_param(cfg.algo, "replay_num_buckets", 2000)),
-    )
+    replay_storage = str(_algo_param(cfg.algo, "replay_storage", "gpu"))
+    if replay_storage not in ("gpu", "cpu_layered"):
+        raise ValueError(
+            "algo.algo_params.replay_storage must be 'gpu' or 'cpu_layered', "
+            f"got {replay_storage!r}"
+        )
+    layered_transport = str(_algo_param(cfg.algo, "replay_layered_transport", "auto"))
+    if layered_transport not in ("auto", "uva", "h2d"):
+        raise ValueError(
+            "algo.algo_params.replay_layered_transport must be 'auto', 'uva', or "
+            f"'h2d', got {layered_transport!r}"
+        )
+    rebuilder_path = _algo_param(cfg.algo, "replay_sample_rebuilder", None)
+    sample_rebuilder = None
+    if rebuilder_path not in (None, ""):
+        if replay_storage != "cpu_layered":
+            raise ValueError(
+                "algo.algo_params.replay_sample_rebuilder requires replay_storage='cpu_layered'"
+            )
+        sample_rebuilder = resolve_dotted_callable(str(rebuilder_path))
+
     if custom_runtime is not None and custom_runtime.replay_pipeline_factory is not None:
+        if replay_storage != "gpu":
+            raise ValueError(
+                "algo.runtime_resolver provided a replay_pipeline_factory, which "
+                "conflicts with algo.algo_params.replay_storage='cpu_layered'; "
+                "select the replay storage through exactly one mechanism"
+            )
         replay_pipeline_factory = custom_runtime.replay_pipeline_factory
+        replay_storage_owner = "gpu"
+    elif replay_storage == "cpu_layered":
+        replay_pipeline_factory = partial(
+            LayeredAgeBiasedReplayPipeline,
+            decay_step=int(_algo_param(cfg.algo, "decay_step", 0)),
+            min_weight=float(_algo_param(cfg.algo, "replay_min_weight", 0.1)),
+            num_buckets=int(_algo_param(cfg.algo, "replay_num_buckets", 2000)),
+            transport=layered_transport,
+            sample_rebuilder=sample_rebuilder,
+        )
+        replay_storage_owner = "cpu"
+    else:
+        replay_pipeline_factory = partial(
+            AgeBiasedReplayPipeline,
+            decay_step=int(_algo_param(cfg.algo, "decay_step", 0)),
+            min_weight=float(_algo_param(cfg.algo, "replay_min_weight", 0.1)),
+            num_buckets=int(_algo_param(cfg.algo, "replay_num_buckets", 2000)),
+        )
+        replay_storage_owner = "gpu"
 
     return DoubleBufferOffPolicyRunner(
         learner=learner,
@@ -238,5 +282,6 @@ def build_flashsac_double_buffer_runner(
         tensor_runtime_settings=tensor_runtime_settings,
         log_interval=int(cfg.training.log_interval),
         row_schema=row_schema,
+        replay_storage_owner=replay_storage_owner,
         replay_pipeline_factory=replay_pipeline_factory,
     )

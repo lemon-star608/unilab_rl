@@ -1,10 +1,11 @@
 """Age-biased replay sampling for FlashSAC.
 
-The device ring remains owned by the generic GPU-resident pipeline. This
-subclass changes only index selection: zero decay uses uniform sampling,
-while positive and negative decays bias toward recent and older transitions
-respectively. Bucketed sampling preserves that bias approximately for large
-device-resident replay buffers.
+With the device-resident pipeline the device ring remains owned by the generic
+GPU-resident pipeline; with the layered pipeline the authoritative ring is
+CPU-pinned. These subclasses change only index selection: zero decay uses
+uniform sampling, while positive and negative decays bias toward recent and
+older transitions respectively. Bucketed sampling preserves that bias
+approximately for large replay buffers.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import torch
 
 from uni_rl.ipc.replay_buffer import ReplayBuffer
 from uni_rl.ipc.replay_pipelines.gpu_resident import GPUResidentReplayPipeline
+from uni_rl.ipc.replay_pipelines.layered import LayeredReplayPipeline
 
 
 def _linear_age_weights(
@@ -136,4 +138,45 @@ class AgeBiasedReplayPipeline(GPUResidentReplayPipeline):
         self._index_select_packed(indices, slot=slot)
 
 
-__all__ = ["AgeBiasedReplayPipeline"]
+class LayeredAgeBiasedReplayPipeline(LayeredReplayPipeline):
+    """Layered (CPU-pinned) replay with the linear age-bias sampler."""
+
+    def __init__(
+        self,
+        replay_buffer: ReplayBuffer,
+        *,
+        decay_step: int = 0,
+        min_weight: float = 0.1,
+        num_buckets: int = 2000,
+        **kwargs,
+    ) -> None:
+        self.decay_step = int(decay_step)
+        self.min_weight = float(min_weight)
+        self.num_buckets = int(num_buckets)
+        if not 0.0 <= self.min_weight <= 1.0:
+            raise ValueError(f"min_weight must be in [0, 1], got {self.min_weight}")
+        if self.num_buckets < 0:
+            raise ValueError(f"num_buckets must be non-negative, got {self.num_buckets}")
+        super().__init__(replay_buffer, **kwargs)
+
+    def _draw_indices(
+        self,
+        *,
+        visible_size: int,
+        device: torch.device,
+        generator: torch.Generator,
+    ) -> torch.Tensor:
+        return biased_replay_indices(
+            visible_size=visible_size,
+            capacity=self._capacity,
+            current_ptr=int(self._visible_ptr),
+            sample_count=self._sample_count,
+            decay_step=self.decay_step,
+            min_weight=self.min_weight,
+            num_buckets=self.num_buckets,
+            device=device,
+            generator=generator,
+        )
+
+
+__all__ = ["AgeBiasedReplayPipeline", "LayeredAgeBiasedReplayPipeline"]

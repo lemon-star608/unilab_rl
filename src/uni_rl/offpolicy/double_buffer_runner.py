@@ -189,6 +189,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         backend_device_binder: Callable[[str], str | None] | None = None,
         replay_pipeline_factory: Callable[..., GPUResidentReplayPipeline] | None = None,
         row_schema: RowSchema | None = None,
+        replay_storage_owner: str = "gpu",
         target_frequency: int = 1,
         policy_before_critic: bool = False,
         inference_placement: InferencePlacement | None = None,
@@ -364,6 +365,11 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         self.backend_device_binder = backend_device_binder
         self.replay_pipeline_factory = replay_pipeline_factory
         self.row_schema = row_schema
+        if replay_storage_owner not in ("gpu", "cpu"):
+            raise ValueError(
+                f"replay_storage_owner must be 'gpu' or 'cpu', got {replay_storage_owner!r}"
+            )
+        self.replay_storage_owner = replay_storage_owner
         self._collector_ready = False
         self._learner_coordination = LearnerCoordinationState()
         # Multi-GPU synchronous data parallelism (None = the bit-identical
@@ -1452,6 +1458,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             estimate_cuda_tensor_runtime_bytes,
             estimate_offpolicy_bytes,
             raise_if_cuda_memory_over_budget,
+            raise_if_host_memory_over_budget,
             raise_if_shared_memory_over_budget,
             warn_if_over_budget,
         )
@@ -1477,9 +1484,13 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             inference_ring_bytes=0 if gpu_centric_collector else inference_ring_bytes,
             ingress_on_device=gpu_centric_collector,
             row_schema=self.row_schema,
+            replay_storage_owner=self.replay_storage_owner,
         )
         warn_if_over_budget(mem_est, label=f"Off-policy ({self.algo_type})")
         raise_if_shared_memory_over_budget(mem_est, label=f"Off-policy ({self.algo_type})")
+        if self.replay_storage_owner == "cpu":
+            # The pinned replay pool is non-reclaimable; gate it like VRAM.
+            raise_if_host_memory_over_budget(mem_est, label=f"Off-policy ({self.algo_type})")
 
         self._shutdown_recorder.set_phase(owner="learner", phase="startup/cuda_preflight")
         # This guard runs before replay ingress, the inference ring, IPC events,
@@ -1510,6 +1521,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 collector_tensor_native=gpu_centric_collector,
                 persistent_exploration_scratch=self._persistent_inference_scratch_bytes(),
                 row_schema=self.row_schema,
+                replay_storage_owner=self.replay_storage_owner,
             )
             raise_if_cuda_memory_over_budget(
                 cuda_tensor_budget,

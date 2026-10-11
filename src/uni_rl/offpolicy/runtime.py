@@ -74,6 +74,11 @@ def _resolve_callable(path: str) -> Any:
     return resolved
 
 
+def resolve_dotted_callable(path: str) -> Any:
+    """Resolve a dotted ``pkg.module:attr`` path to a callable, failing closed."""
+    return _resolve_callable(path)
+
+
 def resolve_custom_offpolicy_runtime(rl_cfg: dict[str, Any]) -> OffPolicyRuntime | None:
     """Resolve an optional custom off-policy runtime from owner config."""
     runtime_resolver = rl_cfg.get("runtime_resolver")

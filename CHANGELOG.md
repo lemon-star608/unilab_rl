@@ -35,6 +35,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `critic_obs_dim == 0` now declares "no separate critic observation" for
   FlashSAC: replay rows omit the duplicated critic groups and the critic
   consumes the actor observation.
+- CPU-pinned layered replay (`LayeredReplayPipeline`) for FlashSAC via
+  `algo.algo_params.replay_storage: "cpu_layered"` (default `"gpu"`, behavior
+  unchanged). The authoritative ring lives in host memory pinned with
+  `cudaHostRegister(PORTABLE|MAPPED)` (exact pinning; the torch pinned
+  allocator rounds blocks > 32 GiB to a power of two). Sampling prefers a
+  native UVA gather kernel (JIT-built, self-tested at construction) and falls
+  back to pinned staging + side-stream H2D double buffering
+  (`algo.algo_params.replay_layered_transport: "auto"|"uva"|"h2d"`). Batch
+  views stay fp32 on device, the collector/ingress protocol is unchanged, and
+  a post-sample `algo.algo_params.replay_sample_rebuilder` dotted-path hook
+  can expand aux-driven columns before the learner consumes the batch. The
+  CUDA pre-flight budget accounts replay bytes by storage owner and a new
+  fail-closed host-RAM budget gate (`raise_if_host_memory_over_budget`)
+  covers the non-reclaimable pinned pool.
 
 ## [1.4.11] - 2026-10-09
 

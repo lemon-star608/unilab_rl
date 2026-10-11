@@ -541,6 +541,7 @@ def test_flashsac_builder_without_runtime_matches_baseline(
     assert runner.kwargs["algo_type"] == "flashsac"
     assert runner.kwargs["actor_adapter_modules"] == ()
     assert runner.kwargs["learner_prepare_hook"] is None
+    assert runner.kwargs["replay_storage_owner"] == "gpu"
     factory = runner.kwargs["replay_pipeline_factory"]
     assert factory.func is AgeBiasedReplayPipeline
     assert factory.keywords == {
@@ -650,4 +651,80 @@ def test_flashsac_builder_rejects_invalid_row_schema_config(
     cfg = _flashsac_cfg()
     cfg.algo.algo_params.replay_float_dtype = "bf16"
     with pytest.raises(ValueError, match="fp32"):
+        _build_flashsac_runner(cfg)
+
+
+def stub_sample_rebuilder(batch: dict[str, Any], *, indices: Any, device: Any) -> dict[str, Any]:
+    del indices, device
+    return batch
+
+
+def test_flashsac_builder_selects_layered_replay_storage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uni_rl.algos.flash_sac.double_buffer as module
+    from uni_rl.algos.flash_sac.replay import LayeredAgeBiasedReplayPipeline
+
+    _patch_flashsac_builder(module, monkeypatch)
+
+    cfg = _flashsac_cfg()
+    cfg.algo.algo_params.replay_storage = "cpu_layered"
+    cfg.algo.algo_params.replay_layered_transport = "h2d"
+    cfg.algo.algo_params.replay_sample_rebuilder = f"{__name__}:stub_sample_rebuilder"
+    cfg.algo.algo_params.decay_step = 5
+    runner = _build_flashsac_runner(cfg)
+
+    assert runner.kwargs["replay_storage_owner"] == "cpu"
+    factory = runner.kwargs["replay_pipeline_factory"]
+    assert factory.func is LayeredAgeBiasedReplayPipeline
+    assert factory.keywords["transport"] == "h2d"
+    assert factory.keywords["sample_rebuilder"] is stub_sample_rebuilder
+    assert factory.keywords["decay_step"] == 5
+    assert factory.keywords["min_weight"] == 0.1
+    assert factory.keywords["num_buckets"] == 2000
+
+
+def test_flashsac_builder_rejects_rebuilder_without_layered_storage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uni_rl.algos.flash_sac.double_buffer as module
+
+    _patch_flashsac_builder(module, monkeypatch)
+
+    cfg = _flashsac_cfg()
+    cfg.algo.algo_params.replay_sample_rebuilder = f"{__name__}:stub_sample_rebuilder"
+    with pytest.raises(ValueError, match="cpu_layered"):
+        _build_flashsac_runner(cfg)
+
+
+def test_flashsac_builder_rejects_layered_storage_with_custom_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uni_rl.algos.flash_sac.double_buffer as module
+    from uni_rl.offpolicy.runtime import OffPolicyRuntime
+
+    _patch_flashsac_builder(module, monkeypatch)
+
+    def _custom_factory(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("unused")
+
+    runtime = OffPolicyRuntime(replay_pipeline_factory=_custom_factory)
+    monkeypatch.setattr(module, "resolve_custom_offpolicy_runtime", lambda rl_cfg: runtime)
+
+    cfg = _flashsac_cfg()
+    cfg.algo.algo_params.replay_storage = "cpu_layered"
+    with pytest.raises(ValueError, match="exactly one mechanism"):
+        _build_flashsac_runner(cfg)
+
+
+def test_flashsac_builder_rejects_invalid_replay_storage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uni_rl.algos.flash_sac.double_buffer as module
+
+    _patch_flashsac_builder(module, monkeypatch)
+
+    cfg = _flashsac_cfg()
+    cfg.algo.algo_params.replay_storage = "ssd"
+    with pytest.raises(ValueError, match="replay_storage"):
         _build_flashsac_runner(cfg)
