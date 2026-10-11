@@ -49,6 +49,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CUDA pre-flight budget accounts replay bytes by storage owner and a new
   fail-closed host-RAM budget gate (`raise_if_host_memory_over_budget`)
   covers the non-reclaimable pinned pool.
+- FlashSAC `n_step > 1` via collector-side return folding
+  (`algo.algo_params.n_step`, default 1, behavior unchanged). The collector
+  folds the reward window into a discounted sum whose chain stops after the
+  first done in the span (FlashDexRetarget semantics; no rows dropped) and
+  points `next_obs` at the span end — the terminal patch keeps storing the
+  true final observation for timeout rows. Multi-head `(m, H)` rewards fold
+  head-wise. The learner needs no change (`gamma ** n_step` was already
+  honored), and the reward normalizer keeps tracking *raw* per-step returns
+  through a bounded shared `RawRewardStatsRing` drained once per iteration
+  (overflow drops are counted, never blocking collection).
 
 ## [1.4.11] - 2026-10-09
 

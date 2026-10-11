@@ -30,6 +30,7 @@ from uni_rl.ipc.replay_pipelines.gpu_resident import (
     GPUResidentReplayPipeline,
     require_offpolicy_replay_device,
 )
+from uni_rl.ipc.reward_stats_ring import RawRewardStatsRing
 from uni_rl.ipc.row_schema import RowSchema
 from uni_rl.logging import OffPolicyLogger, TraceRecorder
 from uni_rl.logging.metric_schema import METRIC_SCHEMA_VERSION, metric_spec, normalize_metric_map
@@ -43,6 +44,7 @@ from uni_rl.offpolicy.coordination import LearnerCoordinationState
 from uni_rl.offpolicy.runner import (
     OffPolicyRunner,
     build_offpolicy_sample_info,
+    drain_raw_reward_stats,
     replay_buffer_ready_for_learning,
 )
 from uni_rl.offpolicy.shutdown_diagnostics import ShutdownDiagnosticsRecorder
@@ -190,6 +192,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         replay_pipeline_factory: Callable[..., GPUResidentReplayPipeline] | None = None,
         row_schema: RowSchema | None = None,
         replay_storage_owner: str = "gpu",
+        n_step: int = 1,
         target_frequency: int = 1,
         policy_before_critic: bool = False,
         inference_placement: InferencePlacement | None = None,
@@ -370,6 +373,18 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 f"replay_storage_owner must be 'gpu' or 'cpu', got {replay_storage_owner!r}"
             )
         self.replay_storage_owner = replay_storage_owner
+        if isinstance(n_step, bool) or not isinstance(n_step, int) or n_step < 1:
+            raise ValueError(f"n_step must be a positive integer, got {n_step!r}")
+        self.n_step = n_step
+        # With collector-side n-step folding, replay rows carry folded rewards;
+        # the learner normalizer tracks raw per-step returns through a dedicated
+        # shared ring (created only when there is a normalizer to feed).
+        self._reward_stats_ring: RawRewardStatsRing | None = None
+        if self.n_step > 1 and getattr(self.learner, "reward_normalizer", None) is not None:
+            self._reward_stats_ring = RawRewardStatsRing(
+                num_envs=self.num_envs,
+                reward_heads=int(getattr(self.learner, "reward_head_count", 1)),
+            )
         self._collector_ready = False
         self._learner_coordination = LearnerCoordinationState()
         # Multi-GPU synchronous data parallelism (None = the bit-identical
@@ -1768,6 +1783,12 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 "backend_device_binder": self.backend_device_binder,
                 "learner_coordination": self._learner_coordination,
                 "learner_pid": os.getpid(),
+                "n_step": self.n_step,
+                # The fold discount must equal the learner's TD discount; only
+                # read it when folding is active so gamma-less custom learners
+                # keep working at n_step=1.
+                "n_step_gamma": float(self.learner.gamma) if self.n_step > 1 else 0.0,
+                "reward_stats_ring": self._reward_stats_ring,
             }
             # The collector may finish env construction quickly while the
             # learner is still in its startup sleep. It must observe a healthy
@@ -1791,6 +1812,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             last_buf_log = 0
             write_read_ema = 0.0
             reward_stats_ptr = 0
+            reward_stats_read = 0
             train_start_threshold = self.train_start_threshold
             prepared_tick: int | None = None
             inference_scheduler = _LearnerInferenceScheduler(
@@ -1939,12 +1961,19 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                     trace_recorder,
                 )
                 _reward_stats_ns = time.perf_counter_ns()
-                reward_stats_ptr = self._update_reward_stats_from_replay(
-                    replay_buffer,
-                    reward_stats_ptr,
-                    int(replay_buffer.ptr[0]),
-                    replay_source=replay_pipeline,
-                )
+                if self._reward_stats_ring is not None:
+                    reward_stats_read = drain_raw_reward_stats(
+                        self.learner,
+                        self._reward_stats_ring,
+                        start_read=reward_stats_read,
+                    )
+                else:
+                    reward_stats_ptr = self._update_reward_stats_from_replay(
+                        replay_buffer,
+                        reward_stats_ptr,
+                        int(replay_buffer.ptr[0]),
+                        replay_source=replay_pipeline,
+                    )
                 if trace_recorder:
                     trace_recorder.add_slice(
                         "learner/update_reward_stats",

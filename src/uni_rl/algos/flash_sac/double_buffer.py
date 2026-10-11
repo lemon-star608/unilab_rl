@@ -50,8 +50,9 @@ def _validate_flashsac_double_buffer_runtime(
 ) -> None:
     if replay_prefetch_mode != "one_tick":
         raise ValueError("FlashSAC device replay requires replay_prefetch_mode='one_tick'")
-    if cfg.algo.algo_params.n_step != 1:
-        raise ValueError("FlashSAC-B initially supports n_step=1 only")
+    n_step = cfg.algo.algo_params.n_step
+    if isinstance(n_step, bool) or not isinstance(n_step, int) or n_step < 1:
+        raise ValueError(f"FlashSAC n_step must be a positive integer, got {n_step!r}")
 
 
 def build_flashsac_double_buffer_runner(
@@ -283,5 +284,6 @@ def build_flashsac_double_buffer_runner(
         log_interval=int(cfg.training.log_interval),
         row_schema=row_schema,
         replay_storage_owner=replay_storage_owner,
+        n_step=int(cfg.algo.algo_params.n_step),
         replay_pipeline_factory=replay_pipeline_factory,
     )

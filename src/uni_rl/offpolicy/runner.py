@@ -94,6 +94,30 @@ def update_reward_stats_from_replay(
     return end_ptr
 
 
+def drain_raw_reward_stats(
+    learner: Any,
+    ring: Any,
+    *,
+    start_read: int,
+) -> int:
+    """Drain raw collector-published reward stats into the learner normalizer.
+
+    Used when collector-side n-step folding is active: replay rows carry
+    folded rewards, while the reward normalizer must keep tracking raw
+    per-step returns. The read cursor always advances, even when the learner
+    has no normalizer to feed.
+    """
+    rewards, dones, new_read = ring.drain()
+    if (
+        rewards.shape[0] > 0
+        and hasattr(learner, "update_reward_stats")
+        and getattr(learner, "reward_normalizer", None) is not None
+    ):
+        learner.update_reward_stats(rewards, dones)
+    ring.commit_drain(new_read)
+    return int(new_read)
+
+
 class OffPolicyRunner(AsyncRunner):
     """Shared lifecycle and metrics helpers for the device replay runner."""
 

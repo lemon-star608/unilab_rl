@@ -542,6 +542,7 @@ def test_flashsac_builder_without_runtime_matches_baseline(
     assert runner.kwargs["actor_adapter_modules"] == ()
     assert runner.kwargs["learner_prepare_hook"] is None
     assert runner.kwargs["replay_storage_owner"] == "gpu"
+    assert runner.kwargs["n_step"] == 1
     factory = runner.kwargs["replay_pipeline_factory"]
     assert factory.func is AgeBiasedReplayPipeline
     assert factory.keywords == {
@@ -727,4 +728,33 @@ def test_flashsac_builder_rejects_invalid_replay_storage(
     cfg = _flashsac_cfg()
     cfg.algo.algo_params.replay_storage = "ssd"
     with pytest.raises(ValueError, match="replay_storage"):
+        _build_flashsac_runner(cfg)
+
+
+def test_flashsac_builder_forwards_n_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uni_rl.algos.flash_sac.double_buffer as module
+
+    _patch_flashsac_builder(module, monkeypatch)
+
+    cfg = _flashsac_cfg()
+    cfg.algo.algo_params.n_step = 5
+    runner = _build_flashsac_runner(cfg)
+
+    assert runner.kwargs["n_step"] == 5
+    assert _FakeLearner.last_kwargs["n_step"] == 5
+
+
+@pytest.mark.parametrize("bad", [0, -1, 1.5, "5", True])
+def test_flashsac_builder_rejects_invalid_n_step(
+    monkeypatch: pytest.MonkeyPatch, bad: object
+) -> None:
+    import uni_rl.algos.flash_sac.double_buffer as module
+
+    _patch_flashsac_builder(module, monkeypatch)
+
+    cfg = _flashsac_cfg()
+    cfg.algo.algo_params.n_step = bad
+    with pytest.raises(ValueError, match="n_step must be a positive integer"):
         _build_flashsac_runner(cfg)
