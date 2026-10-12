@@ -317,6 +317,8 @@ def off_policy_collector_fn(
     n_step: int = 1,
     n_step_gamma: float = 0.99,
     reward_stats_ring=None,
+    replay_ingress_transformer=None,
+    replay_ingress_transformer_params=None,
 ):
     """Entry point for the off-policy collector subprocess.
 
@@ -352,6 +354,8 @@ def off_policy_collector_fn(
         n_step=n_step,
         n_step_gamma=n_step_gamma,
         reward_stats_ring=reward_stats_ring,
+        replay_ingress_transformer=replay_ingress_transformer,
+        replay_ingress_transformer_params=replay_ingress_transformer_params,
     )
 
 
