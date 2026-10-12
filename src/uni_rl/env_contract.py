@@ -25,6 +25,10 @@ Contract summary (tensor-native, autoresetting vectorized env):
 - Optional cold-path metadata remains available through
   :func:`get_algo_capabilities`; algorithm code must not probe private env
   attributes.
+- Optional backend tensor-runtime diagnostics (for example whether the
+  physics backend replays a CUDA graph) are collected through
+  :func:`get_backend_runtime_diagnostics` on cold paths and published into
+  the off-policy runtime manifest.
 
 Because collectors run in ``multiprocessing`` spawn subprocesses, an
 ``EnvFactory`` must be picklable by reference — use a top-level function or
@@ -100,6 +104,21 @@ class SupportsAlgoCapabilitiesProtocol(Protocol):
 
     @property
     def algo_capabilities(self) -> EnvAlgoCapabilitiesProtocol: ...
+
+
+@runtime_checkable
+class SupportsBackendDiagnosticsProtocol(Protocol):
+    """Optional provider protocol: envs expose backend runtime diagnostics."""
+
+    def get_backend_runtime_diagnostics(self) -> Mapping[str, Any]:
+        """Return a plain-JSON snapshot of backend tensor-runtime diagnostics.
+
+        Cold paths only. The payload carries at least ``available`` (bool);
+        when available it also carries ``backend_type`` (str) and a
+        ``diagnostics`` mapping of optimization name to
+        ``{"requested": bool, "enabled": bool, "disable_reason": str | None}``.
+        """
+        ...
 
 
 @runtime_checkable
@@ -180,6 +199,18 @@ def get_algo_capabilities(env: Any) -> EnvAlgoCapabilitiesProtocol:
     return EnvAlgoCapabilities()
 
 
+def get_backend_runtime_diagnostics(env: Any) -> Mapping[str, Any] | None:
+    """Return the env's backend runtime diagnostics, or ``None``.
+
+    Cold paths only (collector startup). Returns ``None`` when the env does
+    not implement :class:`SupportsBackendDiagnosticsProtocol`; callers record
+    an explicit unavailable marker instead of probing private attributes.
+    """
+    if isinstance(env, SupportsBackendDiagnosticsProtocol):
+        return env.get_backend_runtime_diagnostics()
+    return None
+
+
 __all__ = [
     "REPLAY_AUX_INFO_KEY",
     "EnvAlgoCapabilities",
@@ -189,5 +220,7 @@ __all__ = [
     "EnvProtocol",
     "EnvStateProtocol",
     "SupportsAlgoCapabilitiesProtocol",
+    "SupportsBackendDiagnosticsProtocol",
     "get_algo_capabilities",
+    "get_backend_runtime_diagnostics",
 ]

@@ -139,6 +139,88 @@ def test_shutdown_is_experimental_and_opaque() -> None:
     validate_runtime_manifest(manifest, completed=True)
 
 
+def _backend_diagnostics() -> dict[str, Any]:
+    return {
+        "available": True,
+        "backend_type": "mjwarp",
+        "diagnostics": {
+            "cuda_graph": {"requested": True, "enabled": True, "disable_reason": None},
+            "selected_reset_sensor_refresh": {
+                "requested": True,
+                "enabled": False,
+                "disable_reason": "not requested",
+            },
+        },
+    }
+
+
+def test_backend_diagnostics_available_passes() -> None:
+    manifest = _manifest()
+    manifest["backend_diagnostics"] = _backend_diagnostics()
+
+    validate_runtime_manifest(manifest, completed=True)
+
+
+def test_backend_diagnostics_unavailable_requires_explicit_reason() -> None:
+    manifest = _manifest()
+    manifest["backend_diagnostics"] = {
+        "available": False,
+        "unavailable_reason": "env does not expose backend runtime diagnostics",
+    }
+
+    validate_runtime_manifest(manifest, completed=True)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda section: section.update(available="yes"), "available must be a bool"),
+        (
+            lambda section: section.update(backend_type=""),
+            "backend_type must be a non-empty string",
+        ),
+        (lambda section: section.pop("backend_type"), "backend_type is required"),
+        (lambda section: section.pop("diagnostics"), "diagnostics must be a mapping"),
+        (
+            lambda section: section["diagnostics"]["cuda_graph"].update(enabled=1),
+            "enabled must be a bool",
+        ),
+        (
+            lambda section: section["diagnostics"]["cuda_graph"].update(disable_reason="x"),
+            "must not declare a disable reason",
+        ),
+        (
+            lambda section: section["diagnostics"]["cuda_graph"].update(
+                enabled=False, disable_reason=None
+            ),
+            "must declare a disable reason",
+        ),
+        (
+            lambda section: section.update(
+                available=False, unavailable_reason=None, backend_type="mjwarp"
+            ),
+            "unavailable_reason must be a non-empty string",
+        ),
+    ],
+)
+def test_backend_diagnostics_fail_closed(mutation: Any, message: str) -> None:
+    manifest = _manifest()
+    section = _backend_diagnostics()
+    mutation(section)
+    manifest["backend_diagnostics"] = section
+
+    with pytest.raises(ValueError, match=message):
+        validate_runtime_manifest(manifest, completed=True)
+
+
+def test_backend_diagnostics_rejects_non_mapping_section() -> None:
+    manifest = _manifest()
+    manifest["backend_diagnostics"] = "mjwarp"
+
+    with pytest.raises(ValueError, match="backend_diagnostics must be a mapping"):
+        validate_runtime_manifest(manifest, completed=True)
+
+
 def test_metric_schema_version_is_separate_from_runtime_manifest_version() -> None:
     assert METRIC_SCHEMA_VERSION == 1
     assert RUNTIME_MANIFEST_SCHEMA_VERSION == 1

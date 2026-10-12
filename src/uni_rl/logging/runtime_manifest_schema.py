@@ -104,6 +104,65 @@ def validate_runtime_manifest(
                 "runtime_manifest.replay_ingress.backpressure_wait_s must be non-negative"
             )
 
+    _validate_backend_diagnostics(manifest)
+
+
+def _validate_backend_diagnostics(manifest: Mapping[str, Any]) -> None:
+    """Validate the optional ``backend_diagnostics`` producer section.
+
+    The section is optional; when present it must fail closed: an available
+    payload declares the backend type and per-optimization entries mirroring
+    the unisim ``TensorRuntimeDiagnostic`` invariants, while an unavailable
+    payload must explicitly record why.
+    """
+    section = manifest.get("backend_diagnostics")
+    if section is None:
+        return
+    if not isinstance(section, Mapping):
+        raise ValueError("runtime_manifest.backend_diagnostics must be a mapping")
+    available = section.get("available")
+    if not isinstance(available, bool):
+        raise ValueError("runtime_manifest.backend_diagnostics.available must be a bool")
+    backend_type = section.get("backend_type")
+    if backend_type is not None and (not isinstance(backend_type, str) or not backend_type.strip()):
+        raise ValueError(
+            "runtime_manifest.backend_diagnostics.backend_type must be a non-empty string"
+        )
+    if not available:
+        reason = section.get("unavailable_reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError(
+                "runtime_manifest.backend_diagnostics.unavailable_reason must be a "
+                "non-empty string when available is false"
+            )
+        return
+    if backend_type is None:
+        raise ValueError(
+            "runtime_manifest.backend_diagnostics.backend_type is required when available is true"
+        )
+    diagnostics = section.get("diagnostics")
+    if not isinstance(diagnostics, Mapping):
+        raise ValueError(
+            "runtime_manifest.backend_diagnostics.diagnostics must be a mapping when "
+            "available is true"
+        )
+    for name, entry in diagnostics.items():
+        label = f"runtime_manifest.backend_diagnostics.diagnostics.{name}"
+        if not isinstance(entry, Mapping):
+            raise ValueError(f"{label} must be a mapping")
+        for field in ("requested", "enabled"):
+            if not isinstance(entry.get(field), bool):
+                raise ValueError(f"{label}.{field} must be a bool")
+        disable_reason = entry.get("disable_reason")
+        if disable_reason is not None and not isinstance(disable_reason, str):
+            raise ValueError(f"{label}.disable_reason must be a string or null")
+        if entry["enabled"] and disable_reason is not None:
+            raise ValueError(f"{label} is enabled and must not declare a disable reason")
+        if not entry["enabled"] and not (
+            isinstance(disable_reason, str) and disable_reason.strip()
+        ):
+            raise ValueError(f"{label} is disabled and must declare a disable reason")
+
 
 def _validate_positive_int(
     manifest: Mapping[str, Any],

@@ -5,6 +5,7 @@ import statistics
 import threading
 from collections import deque
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytest
@@ -412,6 +413,121 @@ def test_collector_publishes_ready_after_initialization(
     assert events == ["env_init", "ready"]
     assert metrics_queue.get_nowait()["runtime_manifest"]["inference_owner"] == "learner"
     assert inference_request_queue.get_nowait() == worker_module.COLLECTOR_READY_TICK
+
+
+def _run_ready_collector(
+    monkeypatch: pytest.MonkeyPatch,
+    env: Any,
+    metrics_queue: queue.Queue,
+) -> None:
+    stop_event = threading.Event()
+
+    class _ReplayBuffer:
+        trace_recorder = None
+        trace_thread_time = False
+
+        def attach_stop_event(self, stop) -> None:
+            del stop
+
+        def add_batch(self, *args, **kwargs) -> bool:
+            del args, kwargs
+            return True
+
+    def publish_ready(coordination_queue, event) -> bool:
+        del coordination_queue, event
+        # Returning False exits right after the manifest publish, before the
+        # collection loop and its teardown path.
+        return False
+
+    monkeypatch.setattr(worker_module, "apply_torch_thread_runtime", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_module, "apply_training_seed", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_module, "_publish_collector_ready", publish_ready)
+
+    worker_module._run_collector(
+        stop_event=stop_event,
+        env_factory=lambda num_envs, env_cfg_override=None: env,
+        num_envs=1,
+        replay_buffer=_ReplayBuffer(),
+        inference_slot=None,
+        inference_request_queue=queue.Queue(),
+        inference_response_queue=queue.Queue(),
+        algo_type="sac",
+        actor_adapter_modules=None,
+        metrics_queue=metrics_queue,
+        inference_transport="legacy_tensor",
+        sim_backend="mujoco",
+        backend_device=None,
+        env_cfg_override=None,
+        seed=None,
+        trace_enabled=False,
+        trace_thread_time=False,
+    )
+
+
+def test_collector_manifest_publishes_backend_runtime_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metrics_queue: queue.Queue[dict] = queue.Queue()
+
+    class _Env:
+        state = None
+
+        def init_state(self) -> None:
+            self.state = SimpleNamespace(obs={"obs": torch.zeros((1, 2))}, info={})
+
+        def close(self) -> None:
+            pass
+
+        def get_backend_runtime_diagnostics(self) -> dict:
+            return {
+                "available": True,
+                "backend_type": "mjwarp",
+                "diagnostics": {
+                    "cuda_graph": {
+                        "requested": True,
+                        "enabled": False,
+                        "disable_reason": "graph capture failed",
+                    }
+                },
+            }
+
+    _run_ready_collector(monkeypatch, _Env(), metrics_queue)
+
+    manifest = metrics_queue.get_nowait()["runtime_manifest"]
+    assert manifest["backend_diagnostics"] == {
+        "available": True,
+        "backend_type": "mjwarp",
+        "diagnostics": {
+            "cuda_graph": {
+                "requested": True,
+                "enabled": False,
+                "disable_reason": "graph capture failed",
+            }
+        },
+    }
+
+
+def test_collector_manifest_records_unavailable_backend_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metrics_queue: queue.Queue[dict] = queue.Queue()
+
+    class _Env:
+        state = None
+
+        def init_state(self) -> None:
+            self.state = SimpleNamespace(obs={"obs": torch.zeros((1, 2))}, info={})
+
+        def close(self) -> None:
+            pass
+
+    _run_ready_collector(monkeypatch, _Env(), metrics_queue)
+
+    manifest = metrics_queue.get_nowait()["runtime_manifest"]
+    assert manifest["backend_diagnostics"] == {
+        "available": False,
+        "unavailable_reason": "env does not expose backend runtime diagnostics",
+    }
 
 
 def test_collector_requires_batched_replay_publication(
