@@ -315,8 +315,11 @@ class ReplayBuffer(SharedBufferBase):
         """Add batch (called by collector).
 
         `dones` follows the UniLab env lifecycle contract:
-        done = terminated | truncated. Learners must pair it with
-        `truncated` when computing bootstrap masks.
+        done = terminated | truncated. `truncated` is the collector-encoded
+        bootstrap-eligible flag (truncated & ~terminated, uni_rl #29), so
+        learner targets can use clamp(1 - dones + truncated) directly: a
+        failure that also timed out never bootstraps, while timeout-only
+        rows bootstrap from their patched terminal observations.
 
         `rewards` is ``(count,)`` for the default single-head schema or
         ``(count, reward_heads)`` for a multi-head schema. `aux` is the

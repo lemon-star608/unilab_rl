@@ -117,6 +117,33 @@ def _reference_fold(steps: list[dict], n: int, gamma: float) -> list[dict]:
     return out
 
 
+def test_fold_preserves_bootstrap_eligible_truncation_encoding() -> None:
+    """The fold must not re-derive truncation from the combined done flag.
+
+    Collector input already encodes replay ``truncated`` as bootstrap-eligible
+    truncation (``truncated & ~terminated``, uni_rl #29): env0 normal, env1
+    failure-only, env2 timeout-only, env3 failure+timeout. The folded row must
+    carry that encoding to replay verbatim so FlashSAC's
+    ``clamp(1 - dones + truncated)`` never bootstraps the overlap row.
+    """
+    dones = torch.tensor([0.0, 1.0, 1.0, 1.0])
+    truncated = torch.tensor([0.0, 0.0, 1.0, 0.0])
+    folder = NStepRewardFold(1, 0.99)
+    row = folder.push(
+        _step_tensors(
+            0,
+            heads=1,
+            rewards=torch.ones(4),
+            dones=dones,
+            truncated=truncated,
+            final_obs=torch.full((4, _OBS_DIM), 99.0),
+        )
+    )
+    assert row is not None
+    assert torch.equal(row["dones"], dones)
+    assert torch.equal(row["truncated"], truncated)
+
+
 @pytest.mark.parametrize("heads", [1, 2])
 def test_fold_matches_reference_rollout(heads: int) -> None:
     n, gamma, T = 5, 0.98, 14

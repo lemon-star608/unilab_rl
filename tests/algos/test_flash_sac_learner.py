@@ -745,6 +745,31 @@ def test_flashsac_td_target_treats_dones_as_combined_done_with_truncation_bootst
     torch.testing.assert_close(targets[2], torch.tensor([1.0, 0.0, 0.0]))
 
 
+def test_flashsac_td_target_failure_timeout_overlap_does_not_bootstrap() -> None:
+    """uni_rl #29 four-state table against collector-encoded replay columns."""
+    support = torch.tensor([0.0, 1.0, 2.0])
+    target_log_probs = torch.log(torch.tensor([[0.0, 0.0, 1.0]] * 4).clamp_min(1e-8))
+
+    # Collector writes dones = terminated | truncated and truncated =
+    # truncated & ~terminated: normal, failure, timeout, failure+timeout.
+    targets = compute_categorical_td_target(
+        support=support,
+        target_log_probs=target_log_probs,
+        reward=torch.zeros(4),
+        dones=torch.tensor([0.0, 1.0, 1.0, 1.0]),
+        truncated=torch.tensor([0.0, 0.0, 1.0, 0.0]),
+        actor_entropy=torch.zeros(4),
+        gamma=1.0,
+    )
+
+    # Normal and timeout-only rows bootstrap; failure-only and the
+    # failure+timeout overlap project to the reward-only support value 0.0.
+    torch.testing.assert_close(targets[0], torch.tensor([0.0, 0.0, 1.0]))
+    torch.testing.assert_close(targets[1], torch.tensor([1.0, 0.0, 0.0]))
+    torch.testing.assert_close(targets[2], torch.tensor([0.0, 0.0, 1.0]))
+    torch.testing.assert_close(targets[3], torch.tensor([1.0, 0.0, 0.0]))
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph regression")
 def test_flashsac_td_target_is_inductor_cuda_graph_safe() -> None:
     support = torch.linspace(-5.0, 5.0, 11, device="cuda")

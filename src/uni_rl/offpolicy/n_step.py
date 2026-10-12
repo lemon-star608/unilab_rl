@@ -11,6 +11,10 @@ One env-vector transition is pushed per collector step; once the window holds
 - ``dones`` / ``truncated`` / ``next_obs`` / ``next_critic`` / terminal
   fields: taken from the first done transition in the span (the span end), or
   from the newest transition when the span is done-free.
+  ``dones`` is the combined episode flag (terminated | truncated); the
+  collector-encoded ``truncated`` is bootstrap-eligible truncation only
+  (truncated & ~terminated), so a folded failure+timeout span end also keeps
+  ``truncated == 0``.
 - ``obs`` / ``actions`` / ``critic`` / ``aux``: passed through from the
   oldest transition (the row's own step).
 

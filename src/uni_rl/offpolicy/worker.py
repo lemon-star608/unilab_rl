@@ -856,8 +856,14 @@ def _run_collector(
                 # Replay rows store reward heads as provided ((m,) or (m, H));
                 # the row schema validates the shape downstream.
                 rewards_t = state.reward.to(dtype=torch.float32)
-                truncated_t = state.truncated.to(dtype=torch.float32).ravel()
-                combined_dones_t = (state.terminated | state.truncated).to(dtype=torch.float32)
+                terminated_t = state.terminated.to(dtype=torch.float32).ravel()
+                raw_truncated_t = state.truncated.to(dtype=torch.float32).ravel()
+                # uni_rl #29: replay's ``truncated`` column stores
+                # bootstrap-eligible truncation only (truncated & ~terminated)
+                # so a failure that also timed out can never bootstrap. Metric
+                # and episode timeout accounting keep the raw truncation flag.
+                truncated_t = raw_truncated_t * (1.0 - terminated_t)
+                combined_dones_t = torch.clamp(terminated_t + raw_truncated_t, max=1.0)
                 assert rewards_t is not None
                 assert truncated_t is not None
                 assert combined_dones_t is not None
@@ -867,7 +873,7 @@ def _run_collector(
                 tensor_metrics.update(
                     _per_env_metric_rewards(rewards_t, num_envs),
                     done_mask_t,
-                    truncated_t > 0.5,
+                    raw_truncated_t > 0.5,
                 )
                 aux_t = state.info.get(REPLAY_AUX_INFO_KEY)
                 if aux_t is not None and not isinstance(aux_t, torch.Tensor):
@@ -884,16 +890,19 @@ def _run_collector(
                 next_obs_np = np.asarray(next_obs_np, dtype=np.float32)
                 next_critic_np = np.asarray(next_critic_np, dtype=np.float32)
                 rewards_np = np.asarray(state.reward, dtype=np.float32)
-                truncated_np = state.truncated.astype(np.float32, copy=False).ravel()
-                combined_dones = (
-                    (state.terminated | state.truncated).astype(np.float32, copy=False).ravel()
-                )
+                terminated_np = state.terminated.astype(np.float32, copy=False).ravel()
+                raw_truncated_np = state.truncated.astype(np.float32, copy=False).ravel()
+                # uni_rl #29 (host-env branch): replay stores bootstrap-eligible
+                # truncation only; raw truncation remains for metrics and the
+                # terminal-observation timeout contract.
+                truncated_np = raw_truncated_np * (1.0 - terminated_np)
+                combined_dones = np.minimum(terminated_np + raw_truncated_np, 1.0)
                 assert rewards_np is not None
                 assert truncated_np is not None
                 assert combined_dones is not None
                 prev_dones_np = combined_dones
                 done_mask_np = combined_dones > 0.5
-                timeout_mask_np = truncated_np > 0.5
+                timeout_mask_np = raw_truncated_np > 0.5
                 done_count_window += int(np.count_nonzero(done_mask_np))
                 timeout_count_window += int(np.count_nonzero(timeout_mask_np))
                 aux_np = state.info.get(REPLAY_AUX_INFO_KEY)
@@ -902,7 +911,7 @@ def _run_collector(
                     final_observation=state.final_observation,
                     done=done_mask_np,
                     info=state.info,
-                    truncated=truncated_np,
+                    truncated=raw_truncated_np,
                 )
             if tensor_collector:
                 assert obs_t is not None
@@ -922,9 +931,13 @@ def _run_collector(
                 assert combined_dones is not None
                 assert truncated_np is not None
                 assert terminal_contract is not None
-            # ReplayBuffer `dones` follows the UniLab env lifecycle contract:
-            # done = terminated | truncated. Learners use `truncated` to keep
-            # bootstrap enabled for timeout/truncation rows.
+            # Replay rows follow the UniLab env lifecycle contract with the
+            # #29 bootstrap encoding: `dones` = terminated | truncated drives
+            # episode lifecycle, while `truncated` stores bootstrap-eligible
+            # truncation (truncated & ~terminated). Learner targets compute
+            # clamp(1 - dones + truncated), so timeout-only rows bootstrap
+            # from their patched terminal observations while failures —
+            # including failure+timeout overlap — never bootstrap.
             phase_start_ns = _record_phase_ms(
                 cycle_timing_ms, "transition_extract_ms", phase_start_ns
             )

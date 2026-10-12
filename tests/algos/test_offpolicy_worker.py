@@ -13,6 +13,7 @@ import torch
 
 import uni_rl.offpolicy.worker as worker_module
 from uni_rl.algos.common.collector_timing import extract_env_step_breakdown_timing_ms
+from uni_rl.algos.flash_sac.update import compute_categorical_td_target
 from uni_rl.ipc.inference_ring import SharedInferenceRing
 from uni_rl.logging.metrics_drain import RewardComponentWindow, drain_collector_metrics
 from uni_rl.logging.offpolicy import OffPolicyLogger
@@ -1549,3 +1550,147 @@ def test_tensor_collector_folds_n_step_rows_and_publishes_raw_stats(
     assert torch.equal(raw_rewards[:, 0, 0], reward_script[:, 0])
     assert torch.equal(raw_rewards[:, 1, 0], reward_script[:, 1])
     assert torch.equal(raw_dones, done_script)
+
+
+@pytest.mark.parametrize("tensor_env", [True, False])
+def test_collector_encodes_bootstrap_eligible_truncation(
+    monkeypatch: pytest.MonkeyPatch,
+    tensor_env: bool,
+) -> None:
+    """uni_rl #29: failure+timeout overlap must reach replay as truncated=0.
+
+    Four envs cover the full termination table — normal, failure-only,
+    timeout-only, and failure+timeout — through the real collector loop and
+    the n_step=1 fold. Episode ``dones`` stays ``terminated | truncated``;
+    replay's ``truncated`` column is bootstrap-eligible truncation
+    (``truncated & ~terminated``). The captured replay row is then fed
+    straight into the FlashSAC categorical TD target to close the
+    collector -> replay -> learner chain: only normal and timeout-only rows
+    bootstrap; both failure variants project to the reward-only support.
+    """
+    stop_event = threading.Event()
+    metrics_queue: queue.Queue[dict] = queue.Queue(maxsize=4)
+    replay_rows: list[tuple[tuple[torch.Tensor, ...], dict[str, object]]] = []
+
+    n_envs, obs_dim = 4, 2
+    rewards = np.asarray([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+    terminated = np.asarray([False, True, False, True], dtype=bool)
+    truncated = np.asarray([False, False, True, True], dtype=bool)
+    obs0 = np.zeros((n_envs, obs_dim), dtype=np.float32)
+    obs1 = np.ones((n_envs, obs_dim), dtype=np.float32)
+    final_obs = np.asarray([[10.0 + env, 20.0 + env] for env in range(n_envs)], dtype=np.float32)
+
+    def as_env_value(value: np.ndarray):
+        return torch.from_numpy(value.copy()) if tensor_env else value
+
+    class _Env:
+        def __init__(self) -> None:
+            self.state = SimpleNamespace(
+                obs={"obs": as_env_value(obs0)},
+                reward=as_env_value(np.zeros(n_envs, dtype=np.float32)),
+                terminated=as_env_value(np.zeros(n_envs, dtype=bool)),
+                truncated=as_env_value(np.zeros(n_envs, dtype=bool)),
+                final_observation=None,
+                info={"timing": {}},
+            )
+
+        def step(self, actions):
+            del actions
+            self.state = SimpleNamespace(
+                obs={"obs": as_env_value(obs1)},
+                reward=as_env_value(rewards),
+                terminated=as_env_value(terminated),
+                truncated=as_env_value(truncated),
+                final_observation={"obs": as_env_value(final_obs)},
+                info={"timing": {}},
+            )
+            stop_event.set()
+            return self.state
+
+        def close(self):
+            return None
+
+    class _ReplayBuffer:
+        trace_recorder = None
+        trace_thread_time = False
+        size = torch.zeros(1, dtype=torch.int64)
+
+        def attach_stop_event(self, stop) -> None:
+            del stop
+
+        def add_batch(self, *args, **kwargs) -> bool:
+            replay_rows.append((args, kwargs))
+            return True
+
+        def release_ipc(self) -> None:
+            return None
+
+    monkeypatch.setattr(worker_module, "apply_torch_thread_runtime", lambda *a, **kw: None)
+    monkeypatch.setattr(worker_module, "apply_training_seed", lambda *a, **kw: None)
+    ring_ipc = SharedInferenceRing(n_envs, obs_dim, obs_dim, capacity=4)
+
+    def serve_learner_action(coordination_queue, tick_id, stop, **kwargs):
+        del coordination_queue, stop, kwargs
+        ring_ipc.copy_observation_to(
+            tick_id=tick_id,
+            observations=torch.zeros(n_envs, obs_dim),
+            dones=torch.zeros(n_envs),
+            epoch=0,
+        )
+        ring_ipc.publish_action(
+            tick_id=tick_id,
+            policy_version=0,
+            actions=torch.zeros(n_envs, obs_dim),
+            epoch=0,
+        )
+        return True
+
+    monkeypatch.setattr(worker_module, "_wait_for_inference_tick", serve_learner_action)
+    worker_module._run_collector(
+        stop_event=stop_event,
+        env_factory=lambda num_envs, env_cfg_override=None: _Env(),
+        num_envs=n_envs,
+        replay_buffer=_ReplayBuffer(),
+        inference_slot=ring_ipc,
+        inference_request_queue=queue.Queue(),
+        inference_response_queue=queue.Queue(),
+        algo_type="flashsac",
+        actor_adapter_modules=None,
+        metrics_queue=metrics_queue,
+        inference_transport="legacy_tensor",
+        sim_backend="mujoco",
+        backend_device=None,
+        env_cfg_override=None,
+        seed=1,
+        trace_enabled=False,
+        trace_thread_time=False,
+    )
+
+    assert len(replay_rows) == 1
+    args, kwargs = replay_rows[0]
+    obs, actions, replay_rewards, next_obs, dones, replay_truncated = args
+    del obs, actions, replay_rewards
+    assert torch.equal(next_obs, torch.ones((n_envs, obs_dim)))
+    assert torch.equal(dones, torch.tensor([0.0, 1.0, 1.0, 1.0]))
+    assert torch.equal(replay_truncated, torch.tensor([0.0, 0.0, 1.0, 0.0]))
+    # The terminal patch preserves the true final observation for every done
+    # row (failure and timeout alike); bootstrap eligibility is carried only
+    # by the encoded `truncated` column.
+    assert torch.equal(kwargs["terminal_mask"], torch.tensor([False, True, True, True]))
+    assert torch.equal(kwargs["terminal_next_obs"], torch.from_numpy(final_obs))
+
+    support = torch.tensor([0.0, 1.0, 2.0])
+    target_log_probs = torch.log(torch.tensor([[0.0, 0.0, 1.0]] * n_envs).clamp_min(1e-8))
+    targets = compute_categorical_td_target(
+        support=support,
+        target_log_probs=target_log_probs,
+        reward=torch.zeros(n_envs),
+        dones=dones,
+        truncated=replay_truncated,
+        actor_entropy=torch.zeros(n_envs),
+        gamma=1.0,
+    )
+    torch.testing.assert_close(targets[0], torch.tensor([0.0, 0.0, 1.0]))  # normal
+    torch.testing.assert_close(targets[1], torch.tensor([1.0, 0.0, 0.0]))  # failure
+    torch.testing.assert_close(targets[2], torch.tensor([0.0, 0.0, 1.0]))  # timeout
+    torch.testing.assert_close(targets[3], torch.tensor([1.0, 0.0, 0.0]))  # overlap
