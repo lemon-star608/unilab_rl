@@ -608,6 +608,11 @@ class LayeredReplayPipeline:
                 assert indices is not None
                 if self._transport == "uva":
                     assert self._uva_ext is not None
+                    # The native kernel reads ``indices`` asynchronously on the
+                    # sync stream after this Python local can go out of scope.
+                    # Record the allocation with that stream so the caching
+                    # allocator cannot reuse it before the gather completes.
+                    indices.record_stream(self._sync_stream)
                     self._uva_ext.gather_rows_uva(
                         int(ring_slab.data_ptr()) + field.offset * ring_slab.element_size(),
                         int(ring_slab.stride(0) * ring_slab.element_size()),
