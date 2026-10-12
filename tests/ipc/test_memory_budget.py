@@ -497,3 +497,29 @@ def test_budget_drops_next_obs_groups_for_reconstruction() -> None:
     # Ingress slots stay dense; only the pinned ring shrinks.
     assert recon["bounded_ingress_slots"] == dense["bounded_ingress_slots"]
     assert recon["replay_buffer"] < dense["replay_buffer"]
+
+
+def test_memory_budgets_accept_shared_critic_zero_width() -> None:
+    """critic_dim == 0 is the supported shared-critic replay layout."""
+    host = estimate_offpolicy_bytes(
+        num_envs=4,
+        replay_buffer_n=8,
+        obs_dim=8,
+        action_dim=3,
+        critic_dim=0,
+    )
+    assert host["row_width"] == 2 * 8 + 3 + 3
+    cuda = estimate_cuda_tensor_runtime_bytes(
+        num_envs=4,
+        replay_buffer_n=8,
+        obs_dim=8,
+        action_dim=3,
+        critic_dim=0,
+        inference_obs_dim=8,
+        sample_count=4,
+        inference_slot_capacity=2,
+        replay_ingress_depth=2,
+        replay_ingress_slot_rows=4,
+        collector_tensor_native=False,
+    )
+    assert cuda["total"] > 0

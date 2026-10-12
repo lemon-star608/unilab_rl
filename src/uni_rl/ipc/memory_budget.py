@@ -182,7 +182,9 @@ def estimate_offpolicy_bytes(
     integer_values = (num_envs, replay_buffer_n, obs_dim, action_dim, critic_dim, ingress_depth)
     if any(isinstance(value, bool) or not isinstance(value, int) for value in integer_values):
         raise TypeError("off-policy host memory dimensions must be integers")
-    if min(integer_values) <= 0:
+    # critic_dim == 0 is the supported shared-critic layout (the critic
+    # consumes the actor observation and replay rows omit the duplicated group).
+    if min(num_envs, replay_buffer_n, obs_dim, action_dim, ingress_depth) <= 0 or critic_dim < 0:
         raise ValueError("off-policy host memory dimensions must be positive")
     if ingress_slot_rows is None:
         effective_ingress_slot_rows = num_envs
@@ -298,7 +300,20 @@ def estimate_cuda_tensor_runtime_bytes(
     )
     if any(isinstance(value, bool) or not isinstance(value, int) for value in replay_values):
         raise TypeError("CUDA tensor-runtime dimensions must be integers")
-    if min(replay_values) <= 0:
+    # critic_dim == 0 is the supported shared-critic layout.
+    if (
+        min(
+            num_envs,
+            replay_buffer_n,
+            obs_dim,
+            action_dim,
+            sample_count,
+            replay_ingress_depth,
+            replay_ingress_slot_rows,
+        )
+        <= 0
+        or critic_dim < 0
+    ):
         raise ValueError("CUDA tensor-runtime dimensions must be positive")
     if replay_ingress_slot_rows > num_envs:
         raise ValueError(
