@@ -600,7 +600,19 @@ class LayeredReplayPipeline:
         alias_physical = (
             (physical + self._alias_rows) % self._capacity if self._reconstruct_next_obs else None
         )
+        index_ready = None
+        if physical.is_cuda:
+            # The index tensors above are produced on the caller's current
+            # stream, while the gather below reads their values on the sync
+            # stream. ``record_stream`` below only protects the allocation
+            # lifetime; this event additionally orders the producing writes
+            # before the consuming kernel launch, so the kernel can never
+            # dereference uninitialized index values as UVA row offsets.
+            index_ready = torch.cuda.Event()
+            index_ready.record()
         with torch.cuda.stream(self._sync_stream):
+            if index_ready is not None:
+                self._sync_stream.wait_event(index_ready)
             for batch_field, ring_field, use_alias in self._gather_plan:
                 field = self._ring_schema.field(ring_field)
                 ring_slab = self._host_slabs[field.slab]

@@ -517,3 +517,33 @@ class TestLayeredNextObsReconstruction:
                 reconstruct_next_obs=True,
                 next_obs_alias_rows=8,
             )
+
+
+@cuda_only
+def test_uva_gather_waits_for_index_production_stream(pipeline_factory) -> None:
+    """The side-stream gather must observe fully-written index tensor values.
+
+    Logical/physical/alias indices are produced on the caller's current
+    stream, while the UVA kernel reads them on the pipeline's sync stream.
+    Without an explicit event dependency the kernel can race ahead of index
+    generation, read uninitialized int64 values, and gather out-of-bounds UVA
+    rows. Keep the producer stream busy so that race window is open, then
+    verify every sampled row against the producing indices.
+    """
+    rb = _make_replay()
+    pipeline = pipeline_factory(rb, transport="uva")
+    schema = rb._schema
+    pattern = _pattern(_ROWS, schema)
+    _fill(rb, pattern)
+    _wait_visible(pipeline, _ROWS)
+    ring_start_abs = pipeline._visible_ptr - min(pipeline._visible_ptr, pipeline._capacity)
+
+    for tick in range(4):
+        busy = torch.randn(2048, 2048, device="cuda")
+        for _ in range(6):
+            busy = busy @ busy
+        batch = pipeline.sample_large_batch(tick, 16)
+        indices = pipeline._hot_indices.cpu() - ring_start_abs
+        expected = pattern["obs"][indices]
+        assert torch.equal(batch["obs"], expected.to(batch["obs"].device))
+        pipeline.after_tick()
