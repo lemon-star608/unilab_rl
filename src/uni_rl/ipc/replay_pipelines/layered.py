@@ -845,7 +845,14 @@ class LayeredReplayPipeline:
         for packed_tensor in self._packed_slot(slot).values():
             packed_tensor.zero_()
         self._gather_in_flight = None
-        return self._large_batch_view(slot)
+        batch = self._large_batch_view(slot)
+        if self._sample_rebuilder is not None:
+            # The learner consumes full-width observations; the warmup scratch
+            # batch must pass the same post-sample expansion as real batches
+            # (aux is zeroed with the packed slot, which rebuilder layouts
+            # treat as the first motion/step context for shape warmup).
+            batch = self._sample_rebuilder(batch, indices=logical, device=self._device)
+        return batch
 
     def start_prepare(
         self,

@@ -251,6 +251,25 @@ class TestLayeredReplayPipeline:
         assert pipeline._visible_ptr == 0
         rb.close()
 
+    def test_warmup_passes_scratch_batch_through_sample_rebuilder(self, pipeline_factory) -> None:
+        rb = _make_replay()
+        calls: list[dict[str, torch.Tensor]] = []
+
+        def expand(batch, *, indices, device):
+            del indices, device
+            calls.append(batch)
+            out = dict(batch)
+            out["obs"] = torch.zeros(batch["obs"].shape[0], 32)
+            out["next_obs"] = torch.zeros(batch["next_obs"].shape[0], 32)
+            return out
+
+        pipeline = pipeline_factory(rb, transport="h2d", sample_rebuilder=expand)
+        batch = pipeline.warmup()
+        assert len(calls) == 1
+        assert calls[0]["obs"].shape == (16, _OBS_DIM)
+        assert batch["obs"].shape == (16, 32)
+        rb.close()
+
     def test_age_biased_layered_sampler(self, pipeline_factory) -> None:
         from uni_rl.algos.flash_sac.replay import LayeredAgeBiasedReplayPipeline
 
