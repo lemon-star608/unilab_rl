@@ -159,6 +159,14 @@ class EnvProtocol(Protocol):
 # override mapping is opaque to uni_rl and interpreted by the factory owner.
 EnvFactory = Callable[[int, Mapping[str, Any] | None], EnvProtocol]
 
+#: Optional ``state.info`` key carrying per-env replay aux metadata as an
+#: integer tensor of shape ``(num_envs, aux_width)`` (e.g. ``(motion_id,
+#: motion_step)`` for reconstruction hooks). Collectors forward it into the
+#: replay row's int32 aux columns; when the key is absent, aux columns are
+#: zero-filled. Env-side support is owner-layer; the replay row schema
+#: declares the width via ``algo.algo_params.replay_aux_width``.
+REPLAY_AUX_INFO_KEY = "replay_aux"
+
 
 def get_algo_capabilities(env: Any) -> EnvAlgoCapabilitiesProtocol:
     """Return optional env capabilities, or an all-``None`` default.
@@ -173,6 +181,7 @@ def get_algo_capabilities(env: Any) -> EnvAlgoCapabilitiesProtocol:
 
 
 __all__ = [
+    "REPLAY_AUX_INFO_KEY",
     "EnvAlgoCapabilities",
     "EnvAlgoCapabilitiesProtocol",
     "EnvFactory",

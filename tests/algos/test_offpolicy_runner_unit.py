@@ -1277,6 +1277,7 @@ def test_runner_constructs_only_bounded_device_replay(
         "ingress_slot_rows": 2,
         "ingress_depth": 2,
         "ingress_device": "cpu",
+        "row_schema": None,
     }
     assert _FakePipeline.last_kwargs == {
         "device": "cuda",
@@ -2431,3 +2432,35 @@ def test_collector_override_never_carries_removed_tensor_runtime_fields(
         "tensor_runtime_device",
         "inference_transport",
     } & set(override)
+
+
+class _CommittedMultiHeadReplaySource:
+    def read_committed_fields(self, field_names, *, start_ptr):
+        return 8, {
+            "rewards": torch.arange(16, dtype=torch.float32).reshape(8, 2),
+            "dones": torch.tensor([0, 0, 1, 0, 0, 1, 0, 0], dtype=torch.float32),
+        }
+
+
+def test_reward_stats_preserve_reward_head_dimension():
+    learner = _RewardLearner()
+    replay = type("Replay", (), {"capacity": 16})()
+
+    end_ptr = update_reward_stats_from_replay(
+        learner,
+        replay,
+        start_ptr=0,
+        end_ptr=0,
+        num_envs=2,
+        replay_source=_CommittedMultiHeadReplaySource(),
+    )
+
+    assert end_ptr == 8
+    rewards, dones = learner.calls[0]
+    # (rows, heads) committed rewards fold to (steps, num_envs, heads).
+    assert rewards.shape == (4, 2, 2)
+    assert dones.shape == (4, 2)
+    torch.testing.assert_close(
+        rewards,
+        torch.arange(16, dtype=torch.float32).reshape(4, 2, 2),
+    )

@@ -88,10 +88,34 @@ def update_reward_stats_from_replay(
     dones = committed_fields["dones"][-count:]
     num_steps = count // num_envs
     learner.update_reward_stats(
-        rewards.view(num_steps, num_envs),
+        rewards.view(num_steps, num_envs, *rewards.shape[1:]),
         dones.view(num_steps, num_envs),
     )
     return end_ptr
+
+
+def drain_raw_reward_stats(
+    learner: Any,
+    ring: Any,
+    *,
+    start_read: int,
+) -> int:
+    """Drain raw collector-published reward stats into the learner normalizer.
+
+    Used when collector-side n-step folding is active: replay rows carry
+    folded rewards, while the reward normalizer must keep tracking raw
+    per-step returns. The read cursor always advances, even when the learner
+    has no normalizer to feed.
+    """
+    rewards, dones, new_read = ring.drain()
+    if (
+        rewards.shape[0] > 0
+        and hasattr(learner, "update_reward_stats")
+        and getattr(learner, "reward_normalizer", None) is not None
+    ):
+        learner.update_reward_stats(rewards, dones)
+    ring.commit_drain(new_read)
+    return int(new_read)
 
 
 class OffPolicyRunner(AsyncRunner):

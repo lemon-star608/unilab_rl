@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The FlashSAC double-buffer builder now consumes `OffPolicyRuntime` resolved
+  from `algo.runtime_resolver`, matching the SAC builder: `learner_cls` and
+  `algo_type` are replaceable, runtime `actor_kwargs` merge into the learner
+  constructor, `learner_prepare_hook` is forwarded to the runner, and
+  `algo.actor_adapter_modules` (or runtime-provided modules) are imported in
+  the learner process and forwarded to the spawn collector.
+  `OffPolicyRuntime` gains an optional `replay_pipeline_factory` override;
+  without a resolver the builder output is unchanged.
+- Schema-driven replay row layouts (`uni_rl.ipc.row_schema.RowSchema`).
+  The FlashSAC builder generates the row schema from owner config keys
+  `algo.algo_params.reward_head_count` (default 1), `replay_aux_width`
+  (default 0), and `replay_float_dtype` (`"fp32"` default, `"fp16"` for
+  compressed obs/action/critic storage). Rewards store `reward_heads` fp32
+  columns and sample back as `(batch, heads)`; aux columns store per-row
+  int32 env metadata (`env info["replay_aux"]`, zero-filled when absent) and
+  sample back as `(batch, aux_width)`; fp16 groups read back as fp32.
+  Transition rows are validated fail-closed against the schema, and the
+  memory-budget pre-flight follows exact per-slab row bytes. The default
+  schema reproduces the historical packed fp32 layout bit for bit.
+- FlashSAC `RewardNormalizer` tracks statistics independently per reward
+  head (single-head shapes and math are unchanged), and the categorical
+  critic loss expands per head against 2H critic members; the 2H critic
+  network itself is expected from an injected custom learner.
+- `critic_obs_dim == 0` now declares "no separate critic observation" for
+  FlashSAC: replay rows omit the duplicated critic groups and the critic
+  consumes the actor observation.
+- CPU-pinned layered replay (`LayeredReplayPipeline`) for FlashSAC via
+  `algo.algo_params.replay_storage: "cpu_layered"` (default `"gpu"`, behavior
+  unchanged). The authoritative ring lives in host memory pinned with
+  `cudaHostRegister(PORTABLE|MAPPED)` (exact pinning; the torch pinned
+  allocator rounds blocks > 32 GiB to a power of two). Sampling prefers a
+  native UVA gather kernel (JIT-built, self-tested at construction) and falls
+  back to pinned staging + side-stream H2D double buffering
+  (`algo.algo_params.replay_layered_transport: "auto"|"uva"|"h2d"`). Batch
+  views stay fp32 on device, the collector/ingress protocol is unchanged, and
+  a post-sample `algo.algo_params.replay_sample_rebuilder` dotted-path hook
+  can expand aux-driven columns before the learner consumes the batch. The
+  CUDA pre-flight budget accounts replay bytes by storage owner and a new
+  fail-closed host-RAM budget gate (`raise_if_host_memory_over_budget`)
+  covers the non-reclaimable pinned pool.
+- FlashSAC `n_step > 1` via collector-side return folding
+  (`algo.algo_params.n_step`, default 1, behavior unchanged). The collector
+  folds the reward window into a discounted sum whose chain stops after the
+  first done in the span (FlashDexRetarget semantics; no rows dropped) and
+  points `next_obs` at the span end — the terminal patch keeps storing the
+  true final observation for timeout rows. Multi-head `(m, H)` rewards fold
+  head-wise. The learner needs no change (`gamma ** n_step` was already
+  honored), and the reward normalizer keeps tracking *raw* per-step returns
+  through a bounded shared `RawRewardStatsRing` drained once per iteration
+  (overflow drops are counted, never blocking collection).
+- next_obs by-index reconstruction for the CPU-layered replay
+  (`algo.algo_params.replay_reconstruct_next_obs`, default `false`, behavior
+  unchanged). The ring drops the `next_obs`/`next_critic` groups
+  (`RowSchema.without_next_obs`), sampled batches rebuild them from
+  `obs[idx + n_step * num_envs]`, the sampling domain excludes the newest
+  alias span, and done rows' true final observations ride a sparse terminal
+  table (keyed by ring index, evicted on ring overwrite) so reconstructed
+  batches match the dense path bit for bit. Measured: ~x1.9 smaller pinned
+  storage at ~neutral sampling bandwidth (the alias gather reads the obs
+  group twice per sampled row).
+
 ## [1.4.11] - 2026-10-09
 
 ### Added

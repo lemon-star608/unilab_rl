@@ -1244,3 +1244,192 @@ def test_explicit_cpu_transport_rejects_cuda_tensor_observations() -> None:
             trace_enabled=False,
             trace_thread_time=False,
         )
+
+
+@pytest.mark.parametrize("as_tensor", [False, True])
+def test_per_env_metric_rewards_passthrough_and_head_mean(as_tensor: bool) -> None:
+    from uni_rl.offpolicy.worker import _per_env_metric_rewards
+
+    flat_values = [1.0, 2.0, 3.0]
+    flat = torch.tensor(flat_values) if as_tensor else np.asarray(flat_values, dtype=np.float32)
+    assert _per_env_metric_rewards(flat, 3) is flat
+
+    head_values = [[1.0, 3.0], [2.0, 4.0], [4.0, 8.0]]
+    heads = torch.tensor(head_values) if as_tensor else np.asarray(head_values, dtype=np.float32)
+    reduced = _per_env_metric_rewards(heads, 3)
+    torch.testing.assert_close(
+        torch.as_tensor(np.asarray(reduced)),
+        torch.tensor([2.0, 3.0, 6.0]),
+    )
+
+
+def test_tensor_collector_folds_n_step_rows_and_publishes_raw_stats(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Scripted 8-step rollout through _run_collector with n_step=3.
+
+    The fake env drives a deterministic reward/done script across two envs;
+    captured replay rows must equal the reference n-step fold, and the raw
+    stats ring must hold every raw per-step reward.
+    """
+    stop_event = threading.Event()
+    inference_request_queue: queue.Queue[int] = queue.Queue()
+    inference_response_queue: queue.Queue[int] = queue.Queue()
+    metrics_queue: queue.Queue[dict] = queue.Queue(maxsize=8)
+    replay_rows: list[tuple[tuple[torch.Tensor, ...], dict[str, object]]] = []
+
+    n_envs, n_steps, gamma, obs_dim = 2, 3, 0.5, 2
+    reward_script = torch.tensor(
+        [
+            [1.0, 10.0],
+            [2.0, 20.0],
+            [4.0, 40.0],
+            [8.0, 80.0],
+            [16.0, 160.0],
+            [32.0, 320.0],
+            [64.0, 640.0],
+            [128.0, 1280.0],
+        ]
+    )
+    done_script = torch.zeros(8, n_envs)
+    done_script[4, 0] = 1.0
+    final_obs_script = torch.full((8, n_envs, obs_dim), 99.0)
+    env_obs = [torch.full((n_envs, obs_dim), float(t)) for t in range(9)]
+
+    class _Env:
+        def __init__(self) -> None:
+            self.t = 0
+            self.state = SimpleNamespace(
+                obs={"obs": env_obs[0]},
+                reward=torch.zeros(n_envs),
+                terminated=torch.zeros(n_envs, dtype=torch.bool),
+                truncated=torch.zeros(n_envs, dtype=torch.bool),
+                final_observation=None,
+                info={"timing": {}},
+            )
+
+        def step(self, actions):
+            del actions
+            t = self.t
+            dones = done_script[t]
+            self.state = SimpleNamespace(
+                obs={"obs": env_obs[t + 1]},
+                reward=reward_script[t],
+                terminated=dones.bool(),
+                truncated=torch.zeros(n_envs, dtype=torch.bool),
+                final_observation=({"obs": final_obs_script[t]} if bool(dones.any()) else None),
+                info={"timing": {}},
+            )
+            self.t += 1
+            if self.t >= 8:
+                stop_event.set()
+            return self.state
+
+        def close(self):
+            return None
+
+    class _ReplayBuffer:
+        trace_recorder = None
+        trace_thread_time = False
+        size = torch.zeros(1, dtype=torch.int64)
+
+        def attach_stop_event(self, stop) -> None:
+            del stop
+
+        def add_batch(self, *args, **kwargs) -> bool:
+            replay_rows.append((args, kwargs))
+            return True
+
+        def release_ipc(self) -> None:
+            return None
+
+    monkeypatch.setattr(worker_module, "apply_torch_thread_runtime", lambda *a, **kw: None)
+    monkeypatch.setattr(worker_module, "apply_training_seed", lambda *a, **kw: None)
+    ring_ipc = SharedInferenceRing(n_envs, obs_dim, obs_dim, capacity=4)
+
+    def serve_learner_action(coordination_queue, tick_id, stop, **kwargs):
+        del coordination_queue, stop, kwargs
+        ring_ipc.copy_observation_to(
+            tick_id=tick_id,
+            observations=torch.zeros(n_envs, obs_dim),
+            dones=torch.zeros(n_envs),
+            epoch=0,
+        )
+        ring_ipc.publish_action(
+            tick_id=tick_id,
+            policy_version=0,
+            actions=torch.zeros(n_envs, obs_dim),
+            epoch=0,
+        )
+        return True
+
+    monkeypatch.setattr(worker_module, "_wait_for_inference_tick", serve_learner_action)
+    from uni_rl.ipc.reward_stats_ring import RawRewardStatsRing
+
+    stats_ring = RawRewardStatsRing(num_envs=n_envs, reward_heads=1, depth=16)
+    worker_module._run_collector(
+        stop_event=stop_event,
+        env_factory=lambda num_envs, env_cfg_override=None: _Env(),
+        num_envs=n_envs,
+        replay_buffer=_ReplayBuffer(),
+        inference_slot=ring_ipc,
+        inference_request_queue=inference_request_queue,
+        inference_response_queue=inference_response_queue,
+        algo_type="flashsac",
+        actor_adapter_modules=None,
+        metrics_queue=metrics_queue,
+        inference_transport="legacy_tensor",
+        sim_backend="mujoco",
+        backend_device=None,
+        env_cfg_override=None,
+        seed=1,
+        trace_enabled=False,
+        trace_thread_time=False,
+        n_step=n_steps,
+        n_step_gamma=gamma,
+        reward_stats_ring=stats_ring,
+    )
+
+    # 8 env steps -> 6 folded rows (the first n-1 steps emit nothing).
+    assert len(replay_rows) == 8 - n_steps + 1
+
+    def ref_reward(env: int, start: int) -> torch.Tensor:
+        r = reward_script[start + 2, env]
+        for index in reversed(range(start, start + 2)):
+            d = done_script[index, env]
+            r = reward_script[index, env] + gamma * r * (1.0 - d)
+        return r
+
+    for emit_index, (args, kwargs) in enumerate(replay_rows):
+        obs, actions, rewards, next_obs, dones, truncated = args
+        step = emit_index
+        assert torch.equal(obs, env_obs[step])
+        for env in range(n_envs):
+            assert torch.equal(rewards[env], ref_reward(env, step))
+        # Span-end done flags and next_obs rows.
+        span_done = done_script[step : step + n_steps, :].any(dim=0)
+        for env in range(n_envs):
+            first_done_rel = (
+                int(torch.nonzero(done_script[step : step + n_steps, env]).min())
+                if span_done[env]
+                else None
+            )
+            if first_done_rel is not None:
+                end_step = step + first_done_rel
+                assert dones[env] == 1.0
+                # Timeout/terminated span end keeps the true final obs via the
+                # terminal patch fields (final_obs = 99.0 here).
+                terminal_next_obs = kwargs["terminal_next_obs"]
+                assert terminal_next_obs is not None
+                assert torch.equal(terminal_next_obs[env], final_obs_script[end_step][env])
+            else:
+                assert dones[env] == 0.0
+                assert torch.equal(next_obs[env], env_obs[step + n_steps][env])
+
+    # Raw per-step rewards reached the stats ring untouched by the fold.
+    raw_rewards, raw_dones, read = stats_ring.drain()
+    assert read == 8
+    assert raw_rewards.shape == (8, n_envs, 1)
+    assert torch.equal(raw_rewards[:, 0, 0], reward_script[:, 0])
+    assert torch.equal(raw_rewards[:, 1, 0], reward_script[:, 1])
+    assert torch.equal(raw_dones, done_script)

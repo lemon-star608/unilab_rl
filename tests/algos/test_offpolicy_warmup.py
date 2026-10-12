@@ -379,6 +379,7 @@ def test_gpu_resident_replay_pipeline_warmup_uses_scratch_gather_only(
         0: torch.zeros(8, 12),
         1: torch.empty(8, 12),
     }
+    pipeline._gpu_packed_slabs = [[pipeline._gpu_packed[0], pipeline._gpu_packed[1]]]
     gathered: list[tuple[int, int]] = []
 
     def gather_rows(*, visible_size: int, slot: int, gen: torch.Generator) -> None:

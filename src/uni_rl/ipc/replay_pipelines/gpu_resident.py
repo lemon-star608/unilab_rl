@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Tuple, cast
 
 import torch
 
-from uni_rl.ipc.replay_buffer import ReplayBuffer
+from uni_rl.ipc.replay_buffer import ReplayBuffer, _as_slab_list
 from uni_rl.ipc.replay_pipelines.base import ReplayTickMetadata
 from uni_rl.ipc.replay_pipelines.transfer import build_replay_transfer_backend
 
@@ -138,12 +138,15 @@ class GPUResidentReplayPipeline:
         self._base_seed = int(base_seed)
         self._trace_recorder = trace_recorder
         self._capacity = int(replay_buffer.capacity)
-        self._storage_width = int(replay_buffer.storage_width)
+        self._schema = replay_buffer.row_schema
+        self._slabs = self._schema.slabs
+        self._storage_width = self._schema.storage_width
         self._packed_width = self._storage_width
+        self._row_bytes = self._schema.storage_row_bytes
 
         # -- device memory guard (hard fail: this pipeline is opt-in) --
-        storage_bytes = self._capacity * self._storage_width * 4
-        slot_bytes = 2 * self._sample_count * self._packed_width * 4
+        storage_bytes = self._capacity * self._row_bytes
+        slot_bytes = 2 * self._sample_count * self._row_bytes
         required_bytes = storage_bytes + slot_bytes
         _validate_device_memory_budget(
             self._device,
@@ -162,17 +165,20 @@ class GPUResidentReplayPipeline:
         )
         self._device_family = self._transfer_backend.device_family
         self._host_pinned = False
-        host_slots = replay_buffer._ingress_slots
-        self._direct_device_ingress = bool(host_slots) and host_slots[0].is_cuda
+        host_slot_slabs = [
+            slab for slot in replay_buffer._ingress_slots for slab in _as_slab_list(slot)
+        ]
+        self._direct_device_ingress = bool(host_slot_slabs) and host_slot_slabs[0].is_cuda
         if self._direct_device_ingress:
-            if host_slots[0].device != self._device:
-                raise ValueError(
-                    "Device ingress must share the authoritative replay device: "
-                    f"got {host_slots[0].device}, expected {self._device}"
-                )
+            for slab in host_slot_slabs:
+                if slab.device != self._device:
+                    raise ValueError(
+                        "Device ingress must share the authoritative replay device: "
+                        f"got {slab.device}, expected {self._device}"
+                    )
         else:
             try:
-                self._transfer_backend.register_host_slots(host_slots)
+                self._transfer_backend.register_host_slots(host_slot_slabs)
                 self._host_pinned = bool(self._transfer_backend.host_pinned)
             except RuntimeError as exc:
                 print(
@@ -180,16 +186,30 @@ class GPUResidentReplayPipeline:
                     "falling back to pageable device copies.",
                     flush=True,
                 )
-        self._gpu_storage: torch.Tensor = torch.empty(
-            (self._capacity, self._storage_width),
-            dtype=torch.float32,
-            device=self._device,
+        storage_slabs = [
+            torch.empty(
+                (self._capacity, slab.width),
+                dtype=slab.dtype,
+                device=self._device,
+            )
+            for slab in self._slabs
+        ]
+        # Single-slab schemas (the default) keep the historical bare-tensor
+        # device ring; multi-slab schemas keep one device tensor per slab.
+        self._gpu_storage: torch.Tensor | list[torch.Tensor] = (
+            storage_slabs[0] if len(storage_slabs) == 1 else storage_slabs
         )
-        self._gpu_packed = self._transfer_backend.allocate_device_slots(
-            count=2,
-            shape=(self._sample_count, self._packed_width),
-            dtype=torch.float32,
-        )
+        self._gpu_storage_slabs = storage_slabs
+        packed_slabs = [
+            self._transfer_backend.allocate_device_slots(
+                count=2,
+                shape=(self._sample_count, slab.width),
+                dtype=slab.dtype,
+            )
+            for slab in self._slabs
+        ]
+        self._gpu_packed_slabs = packed_slabs
+        self._gpu_packed = packed_slabs[0] if len(packed_slabs) == 1 else packed_slabs
         self._sync_stream: Any | None = None
         if self._device.type == "cuda":
             self._sync_stream = cast(torch.cuda.Stream, torch.cuda.Stream(device=self._device))
@@ -244,7 +264,10 @@ class GPUResidentReplayPipeline:
             "host_pinned": self._host_pinned,
             "storage_rows": self._capacity,
             "storage_width": self._storage_width,
-            "storage_bytes": int(self._gpu_storage.numel() * self._gpu_storage.element_size()),
+            "storage_bytes": int(
+                sum(slab.numel() * slab.element_size() for slab in self._gpu_storage_slabs)
+            ),
+            "row_schema": self._schema.summary(),
             "host_storage_bytes": self._replay_buffer.host_storage_bytes,
             "ingress_depth": self._replay_buffer._ingress_depth,
             "ingress_slot_rows": self._replay_buffer._ingress_slot_rows,
@@ -267,23 +290,42 @@ class GPUResidentReplayPipeline:
 
     # -- batch views ----------------------------------------------------------
 
-    def _packed_batch_view(self, packed: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def _packed_slot(self, slot: int) -> torch.Tensor | list[torch.Tensor]:
+        payloads = [slab_slots[slot] for slab_slots in self._gpu_packed_slabs]
+        return payloads[0] if len(payloads) == 1 else payloads
+
+    def _read_batch_field(
+        self,
+        packed: torch.Tensor | list[torch.Tensor],
+        field_name: str,
+    ) -> torch.Tensor:
+        """View one batch field, casting non-fp32 float storage back to fp32."""
+        view = self._replay_buffer.field_view(packed, field_name)
+        if view.is_floating_point() and view.dtype != torch.float32:
+            return view.to(torch.float32)
+        return view
+
+    def _packed_batch_view(
+        self, packed: torch.Tensor | list[torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
         rb = self._replay_buffer
         batch = {
-            "obs": packed[:, rb._obs_sl],
-            "next_obs": packed[:, rb._nobs_sl],
-            "actions": packed[:, rb._act_sl],
-            "rewards": packed[:, rb._rew_col],
-            "dones": packed[:, rb._done_col],
-            "truncated": packed[:, rb._trunc_col],
+            "obs": self._read_batch_field(packed, "obs"),
+            "next_obs": self._read_batch_field(packed, "next_obs"),
+            "actions": self._read_batch_field(packed, "actions"),
+            "rewards": self._read_batch_field(packed, "rewards"),
+            "dones": self._read_batch_field(packed, "dones"),
+            "truncated": self._read_batch_field(packed, "truncated"),
         }
         if rb._critic_dim > 0:
-            batch["critic"] = packed[:, rb._critic_sl]
-            batch["next_critic"] = packed[:, rb._ncritic_sl]
+            batch["critic"] = self._read_batch_field(packed, "critic")
+            batch["next_critic"] = self._read_batch_field(packed, "next_critic")
+        if rb._schema.aux_width > 0:
+            batch["aux"] = self._read_batch_field(packed, "aux")
         return batch
 
     def _large_batch_view(self, slot: int) -> Dict[str, torch.Tensor]:
-        return self._packed_batch_view(self._gpu_packed[slot])
+        return self._packed_batch_view(self._packed_slot(slot))
 
     # -- device submission ---------------------------------------------------
 
@@ -368,23 +410,27 @@ class GPUResidentReplayPipeline:
         *,
         start: int,
         end: int,
-        source: torch.Tensor,
+        source: torch.Tensor | list[torch.Tensor],
         ingress_slot: int,
     ) -> None:
         h2d_begin_ns = time.perf_counter_ns()
         start_event = None
         end_event = None
         record_cuda = self._trace_recorder is not None and self._trace_cuda_events
+        source_slabs = _as_slab_list(source)
 
         def copy_spans(*, non_blocking: bool) -> None:
-            source_offset = 0
-            for offset, length in _ring_spans(start, end, self._capacity):
-                source_span = source[source_offset : source_offset + length]
-                self._gpu_storage[offset : offset + length].copy_(
-                    source_span,
-                    non_blocking=non_blocking,
-                )
-                source_offset += length
+            for source_slab, storage_slab in zip(
+                source_slabs, self._gpu_storage_slabs, strict=True
+            ):
+                source_offset = 0
+                for offset, length in _ring_spans(start, end, self._capacity):
+                    source_span = source_slab[source_offset : source_offset + length]
+                    storage_slab[offset : offset + length].copy_(
+                        source_span,
+                        non_blocking=non_blocking,
+                    )
+                    source_offset += length
 
         if self._device.type == "cuda":
             with torch.cuda.device(self._device), torch.cuda.stream(self._sync_stream):
@@ -415,7 +461,7 @@ class GPUResidentReplayPipeline:
                 start_event=start_event,
                 end_event=end_event,
                 args={
-                    "h2d_bytes": (end - start) * self._storage_width * 4,
+                    "h2d_bytes": (end - start) * self._row_bytes,
                     "rows": end - start,
                     "span_start": start,
                     "span_end": end,
@@ -460,6 +506,12 @@ class GPUResidentReplayPipeline:
                 self._prepare_condition.notify_all()
         return drained
 
+    def _index_select_packed(self, indices: torch.Tensor, *, slot: int) -> None:
+        for storage_slab, packed_slabs in zip(
+            _as_slab_list(self._gpu_storage), self._gpu_packed_slabs, strict=True
+        ):
+            torch.index_select(storage_slab, 0, indices, out=packed_slabs[slot])
+
     def _gather_rows(self, *, visible_size: int, slot: int, gen: torch.Generator) -> None:
         indices = torch.randint(
             0,
@@ -468,7 +520,7 @@ class GPUResidentReplayPipeline:
             generator=gen,
             device=self._device,
         )
-        torch.index_select(self._gpu_storage, 0, indices, out=self._gpu_packed[slot])
+        self._index_select_packed(indices, slot=slot)
 
     def _service_pending_prepare(self) -> bool:
         if self._main_thread_submission:
@@ -545,7 +597,7 @@ class GPUResidentReplayPipeline:
                     "tick_id": int(tick_id),
                     "batch_gpu_slot": slot,
                     "sample_count": self._sample_count,
-                    "gather_bytes": self._sample_count * self._packed_width * 4,
+                    "gather_bytes": self._sample_count * self._row_bytes,
                     "pipeline": "gpu_resident",
                 },
             )
@@ -642,7 +694,8 @@ class GPUResidentReplayPipeline:
         else:
             self._gather_rows(visible_size=visible_size, slot=slot, gen=generator)
             torch.mps.synchronize()
-        self._gpu_packed[slot].zero_()
+        for packed_slab in _as_slab_list(self._packed_slot(slot)):
+            packed_slab.zero_()
         return self._large_batch_view(slot)
 
     def start_prepare(
@@ -842,6 +895,7 @@ class GPUResidentReplayPipeline:
                 pass
         self._transfer_backend.close()
         self._host_pinned = False
-        self._gpu_packed.clear()
+        self._gpu_packed_slabs.clear()
+        self._gpu_storage_slabs.clear()
         if hasattr(self, "_gpu_storage"):
             del self._gpu_storage

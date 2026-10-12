@@ -5,16 +5,23 @@ from __future__ import annotations
 import warnings
 from collections.abc import Callable
 from functools import partial
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from omegaconf import DictConfig, OmegaConf
 
 from uni_rl.algos.flash_sac.learner import FlashSACLearner
-from uni_rl.algos.flash_sac.replay import AgeBiasedReplayPipeline
+from uni_rl.algos.flash_sac.replay import AgeBiasedReplayPipeline, LayeredAgeBiasedReplayPipeline
 from uni_rl.env_contract import EnvFactory
 from uni_rl.ipc.replay_pipelines.gpu_resident import require_offpolicy_replay_device
+from uni_rl.ipc.row_schema import RowSchema
+from uni_rl.offpolicy.actor_adapter import import_actor_adapter_modules
 from uni_rl.offpolicy.double_buffer_runner import DoubleBufferOffPolicyRunner
+from uni_rl.offpolicy.runtime import (
+    resolve_actor_adapter_modules,
+    resolve_custom_offpolicy_runtime,
+    resolve_dotted_callable,
+)
 from uni_rl.utils.device import get_default_device
 from uni_rl.utils.nan_guard import NanGuardCfg
 from uni_rl.utils.observations import get_obs_dims
@@ -43,8 +50,9 @@ def _validate_flashsac_double_buffer_runtime(
 ) -> None:
     if replay_prefetch_mode != "one_tick":
         raise ValueError("FlashSAC device replay requires replay_prefetch_mode='one_tick'")
-    if cfg.algo.algo_params.n_step != 1:
-        raise ValueError("FlashSAC-B initially supports n_step=1 only")
+    n_step = cfg.algo.algo_params.n_step
+    if isinstance(n_step, bool) or not isinstance(n_step, int) or n_step < 1:
+        raise ValueError(f"FlashSAC n_step must be a positive integer, got {n_step!r}")
 
 
 def build_flashsac_double_buffer_runner(
@@ -68,6 +76,13 @@ def build_flashsac_double_buffer_runner(
         cfg,
         replay_prefetch_mode=replay_prefetch_mode,
     )
+    rl_cfg = cast(dict[str, Any], OmegaConf.to_container(cfg.algo, resolve=True))
+    custom_runtime = resolve_custom_offpolicy_runtime(rl_cfg)
+    # Import registration modules before the learner builds its actor so
+    # custom adapter registrations are live in this process; the runner
+    # forwards the list to the spawn collector.
+    actor_adapter_modules = resolve_actor_adapter_modules(rl_cfg, custom_runtime)
+    import_actor_adapter_modules(actor_adapter_modules)
     # Resolve public tensor-runtime bounds before constructing a one-env probe.
     # Invalid training knobs must fail closed without materializing a backend.
     tensor_runtime_settings = resolve_tensor_runtime_settings(
@@ -107,6 +122,34 @@ def build_flashsac_double_buffer_runner(
     finally:
         env.close()
 
+    learner_cls: type[Any] = FlashSACLearner
+    algo_type = "flashsac"
+    learner_extra_kwargs: dict[str, Any] = {}
+    if custom_runtime is not None:
+        learner_extra_kwargs = cast(
+            dict[str, Any],
+            custom_runtime.build_model_kwargs(
+                obs_dim=int(obs_dim),
+                critic_obs_dim=int(critic_obs_dim),
+            ),
+        )
+        if custom_runtime.learner_cls is not None:
+            learner_cls = custom_runtime.learner_cls
+        if custom_runtime.algo_type is not None:
+            algo_type = str(custom_runtime.algo_type)
+
+    # Row layout is generated from owner YAML and travels with the run config:
+    # scalar reward (H=1), no aux columns, and fp32 storage reproduce the
+    # historical packed layout bit for bit.
+    row_schema = RowSchema(
+        obs_dim=obs_dim,
+        action_dim=action_dim,
+        critic_dim=critic_obs_dim,
+        reward_heads=int(_algo_param(cfg.algo, "reward_head_count", 1)),
+        aux_width=int(_algo_param(cfg.algo, "replay_aux_width", 0)),
+        float_dtype=_algo_param(cfg.algo, "replay_float_dtype", "fp32"),
+    )
+
     learner_kwargs = {
         "obs_dim": obs_dim,
         "action_dim": action_dim,
@@ -136,6 +179,7 @@ def build_flashsac_double_buffer_runner(
         "normalize_reward": cfg.algo.algo_params.normalize_reward,
         "normalized_g_max": cfg.algo.algo_params.normalized_g_max,
         "n_step": cfg.algo.algo_params.n_step,
+        "reward_head_count": row_schema.reward_heads,
         "obs_normalization": cfg.algo.obs_normalization,
         "use_amp": cfg.training.use_amp,
         "amp_dtype": cfg.algo.algo_params.amp_dtype,
@@ -149,12 +193,73 @@ def build_flashsac_double_buffer_runner(
             _algo_param(cfg.algo, "critic_normalize_parameters", True)
         ),
     }
-    learner = FlashSACLearner(device=device, **learner_kwargs)
+    learner_kwargs.update(learner_extra_kwargs)
+    learner = learner_cls(device=device, **learner_kwargs)
+
+    replay_storage = str(_algo_param(cfg.algo, "replay_storage", "gpu"))
+    if replay_storage not in ("gpu", "cpu_layered"):
+        raise ValueError(
+            "algo.algo_params.replay_storage must be 'gpu' or 'cpu_layered', "
+            f"got {replay_storage!r}"
+        )
+    layered_transport = str(_algo_param(cfg.algo, "replay_layered_transport", "auto"))
+    if layered_transport not in ("auto", "uva", "h2d"):
+        raise ValueError(
+            "algo.algo_params.replay_layered_transport must be 'auto', 'uva', or "
+            f"'h2d', got {layered_transport!r}"
+        )
+    rebuilder_path = _algo_param(cfg.algo, "replay_sample_rebuilder", None)
+    sample_rebuilder = None
+    if rebuilder_path not in (None, ""):
+        if replay_storage != "cpu_layered":
+            raise ValueError(
+                "algo.algo_params.replay_sample_rebuilder requires replay_storage='cpu_layered'"
+            )
+        sample_rebuilder = resolve_dotted_callable(str(rebuilder_path))
+    reconstruct_next_obs = bool(_algo_param(cfg.algo, "replay_reconstruct_next_obs", False))
+    if reconstruct_next_obs and replay_storage != "cpu_layered":
+        raise ValueError(
+            "algo.algo_params.replay_reconstruct_next_obs requires replay_storage='cpu_layered'"
+        )
+
+    if custom_runtime is not None and custom_runtime.replay_pipeline_factory is not None:
+        if replay_storage != "gpu":
+            raise ValueError(
+                "algo.runtime_resolver provided a replay_pipeline_factory, which "
+                "conflicts with algo.algo_params.replay_storage='cpu_layered'; "
+                "select the replay storage through exactly one mechanism"
+            )
+        replay_pipeline_factory = custom_runtime.replay_pipeline_factory
+        replay_storage_owner = "gpu"
+    elif replay_storage == "cpu_layered":
+        replay_pipeline_factory = partial(
+            LayeredAgeBiasedReplayPipeline,
+            decay_step=int(_algo_param(cfg.algo, "decay_step", 0)),
+            min_weight=float(_algo_param(cfg.algo, "replay_min_weight", 0.1)),
+            num_buckets=int(_algo_param(cfg.algo, "replay_num_buckets", 2000)),
+            transport=layered_transport,
+            sample_rebuilder=sample_rebuilder,
+            reconstruct_next_obs=reconstruct_next_obs,
+            next_obs_alias_rows=(
+                int(cfg.algo.algo_params.n_step) * int(cfg.algo.num_envs)
+                if reconstruct_next_obs
+                else None
+            ),
+        )
+        replay_storage_owner = "cpu"
+    else:
+        replay_pipeline_factory = partial(
+            AgeBiasedReplayPipeline,
+            decay_step=int(_algo_param(cfg.algo, "decay_step", 0)),
+            min_weight=float(_algo_param(cfg.algo, "replay_min_weight", 0.1)),
+            num_buckets=int(_algo_param(cfg.algo, "replay_num_buckets", 2000)),
+        )
+        replay_storage_owner = "gpu"
 
     return DoubleBufferOffPolicyRunner(
         learner=learner,
         env_name=cfg.training.task_name,
-        algo_type="flashsac",
+        algo_type=algo_type,
         env_factory=env_factory,
         num_envs=cfg.algo.num_envs,
         replay_buffer_n=cfg.algo.replay_buffer_n,
@@ -180,14 +285,17 @@ def build_flashsac_double_buffer_runner(
         torch_thread_runtime=torch_thread_runtime,
         collector_cpu_ids=collector_cpu_ids,
         dp_sync=dp_sync,
+        learner_prepare_hook=(
+            custom_runtime.learner_prepare_hook if custom_runtime is not None else None
+        ),
         backend_device_binder=backend_device_binder,
+        actor_adapter_modules=actor_adapter_modules,
         inference_placement=inference_placement,
         tensor_runtime_settings=tensor_runtime_settings,
         log_interval=int(cfg.training.log_interval),
-        replay_pipeline_factory=partial(
-            AgeBiasedReplayPipeline,
-            decay_step=int(_algo_param(cfg.algo, "decay_step", 0)),
-            min_weight=float(_algo_param(cfg.algo, "replay_min_weight", 0.1)),
-            num_buckets=int(_algo_param(cfg.algo, "replay_num_buckets", 2000)),
-        ),
+        row_schema=row_schema,
+        replay_storage_owner=replay_storage_owner,
+        n_step=int(cfg.algo.algo_params.n_step),
+        reconstruct_next_obs=reconstruct_next_obs,
+        replay_pipeline_factory=replay_pipeline_factory,
     )

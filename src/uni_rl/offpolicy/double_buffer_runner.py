@@ -30,6 +30,8 @@ from uni_rl.ipc.replay_pipelines.gpu_resident import (
     GPUResidentReplayPipeline,
     require_offpolicy_replay_device,
 )
+from uni_rl.ipc.reward_stats_ring import RawRewardStatsRing
+from uni_rl.ipc.row_schema import RowSchema
 from uni_rl.logging import OffPolicyLogger, TraceRecorder
 from uni_rl.logging.metric_schema import METRIC_SCHEMA_VERSION, metric_spec, normalize_metric_map
 from uni_rl.logging.metrics_drain import RewardComponentWindow
@@ -42,6 +44,7 @@ from uni_rl.offpolicy.coordination import LearnerCoordinationState
 from uni_rl.offpolicy.runner import (
     OffPolicyRunner,
     build_offpolicy_sample_info,
+    drain_raw_reward_stats,
     replay_buffer_ready_for_learning,
 )
 from uni_rl.offpolicy.shutdown_diagnostics import ShutdownDiagnosticsRecorder
@@ -187,6 +190,10 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         learner_prepare_hook: Callable[[Any, OffPolicyWarmupContext], None] | None = None,
         backend_device_binder: Callable[[str], str | None] | None = None,
         replay_pipeline_factory: Callable[..., GPUResidentReplayPipeline] | None = None,
+        row_schema: RowSchema | None = None,
+        replay_storage_owner: str = "gpu",
+        n_step: int = 1,
+        reconstruct_next_obs: bool = False,
         target_frequency: int = 1,
         policy_before_critic: bool = False,
         inference_placement: InferencePlacement | None = None,
@@ -361,6 +368,32 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         # subprocess (e.g. mjwarp); None for backends that need no binding.
         self.backend_device_binder = backend_device_binder
         self.replay_pipeline_factory = replay_pipeline_factory
+        self.row_schema = row_schema
+        if replay_storage_owner not in ("gpu", "cpu"):
+            raise ValueError(
+                f"replay_storage_owner must be 'gpu' or 'cpu', got {replay_storage_owner!r}"
+            )
+        self.replay_storage_owner = replay_storage_owner
+        if isinstance(n_step, bool) or not isinstance(n_step, int) or n_step < 1:
+            raise ValueError(f"n_step must be a positive integer, got {n_step!r}")
+        self.n_step = n_step
+        if not isinstance(reconstruct_next_obs, bool):
+            raise ValueError(f"reconstruct_next_obs must be boolean, got {reconstruct_next_obs!r}")
+        if reconstruct_next_obs and replay_storage_owner != "cpu":
+            raise ValueError(
+                "reconstruct_next_obs requires the CPU-layered replay storage owner "
+                f"(replay_storage_owner='cpu'), got {replay_storage_owner!r}"
+            )
+        self.reconstruct_next_obs = reconstruct_next_obs
+        # With collector-side n-step folding, replay rows carry folded rewards;
+        # the learner normalizer tracks raw per-step returns through a dedicated
+        # shared ring (created only when there is a normalizer to feed).
+        self._reward_stats_ring: RawRewardStatsRing | None = None
+        if self.n_step > 1 and getattr(self.learner, "reward_normalizer", None) is not None:
+            self._reward_stats_ring = RawRewardStatsRing(
+                num_envs=self.num_envs,
+                reward_heads=int(getattr(self.learner, "reward_head_count", 1)),
+            )
         self._collector_ready = False
         self._learner_coordination = LearnerCoordinationState()
         # Multi-GPU synchronous data parallelism (None = the bit-identical
@@ -1449,6 +1482,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             estimate_cuda_tensor_runtime_bytes,
             estimate_offpolicy_bytes,
             raise_if_cuda_memory_over_budget,
+            raise_if_host_memory_over_budget,
             raise_if_shared_memory_over_budget,
             warn_if_over_budget,
         )
@@ -1473,9 +1507,15 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             ingress_slot_rows=self.replay_ingress_slot_rows,
             inference_ring_bytes=0 if gpu_centric_collector else inference_ring_bytes,
             ingress_on_device=gpu_centric_collector,
+            row_schema=self.row_schema,
+            replay_storage_owner=self.replay_storage_owner,
+            reconstruct_next_obs=self.reconstruct_next_obs,
         )
         warn_if_over_budget(mem_est, label=f"Off-policy ({self.algo_type})")
         raise_if_shared_memory_over_budget(mem_est, label=f"Off-policy ({self.algo_type})")
+        if self.replay_storage_owner == "cpu":
+            # The pinned replay pool is non-reclaimable; gate it like VRAM.
+            raise_if_host_memory_over_budget(mem_est, label=f"Off-policy ({self.algo_type})")
 
         self._shutdown_recorder.set_phase(owner="learner", phase="startup/cuda_preflight")
         # This guard runs before replay ingress, the inference ring, IPC events,
@@ -1505,6 +1545,8 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 replay_ingress_slot_rows=self.replay_ingress_slot_rows,
                 collector_tensor_native=gpu_centric_collector,
                 persistent_exploration_scratch=self._persistent_inference_scratch_bytes(),
+                row_schema=self.row_schema,
+                replay_storage_owner=self.replay_storage_owner,
             )
             raise_if_cuda_memory_over_budget(
                 cuda_tensor_budget,
@@ -1543,6 +1585,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             ingress_slot_rows=self.replay_ingress_slot_rows,
             ingress_depth=self.replay_ingress_depth,
             ingress_device=self.device if gpu_centric_collector else "cpu",
+            row_schema=self.row_schema,
             # CPU transport still owns a CUDA replay device and CPU ingress.
         )
         self._active_replay_buffer = replay_buffer
@@ -1750,6 +1793,12 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 "backend_device_binder": self.backend_device_binder,
                 "learner_coordination": self._learner_coordination,
                 "learner_pid": os.getpid(),
+                "n_step": self.n_step,
+                # The fold discount must equal the learner's TD discount; only
+                # read it when folding is active so gamma-less custom learners
+                # keep working at n_step=1.
+                "n_step_gamma": float(self.learner.gamma) if self.n_step > 1 else 0.0,
+                "reward_stats_ring": self._reward_stats_ring,
             }
             # The collector may finish env construction quickly while the
             # learner is still in its startup sleep. It must observe a healthy
@@ -1773,6 +1822,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             last_buf_log = 0
             write_read_ema = 0.0
             reward_stats_ptr = 0
+            reward_stats_read = 0
             train_start_threshold = self.train_start_threshold
             prepared_tick: int | None = None
             inference_scheduler = _LearnerInferenceScheduler(
@@ -1921,12 +1971,19 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                     trace_recorder,
                 )
                 _reward_stats_ns = time.perf_counter_ns()
-                reward_stats_ptr = self._update_reward_stats_from_replay(
-                    replay_buffer,
-                    reward_stats_ptr,
-                    int(replay_buffer.ptr[0]),
-                    replay_source=replay_pipeline,
-                )
+                if self._reward_stats_ring is not None:
+                    reward_stats_read = drain_raw_reward_stats(
+                        self.learner,
+                        self._reward_stats_ring,
+                        start_read=reward_stats_read,
+                    )
+                else:
+                    reward_stats_ptr = self._update_reward_stats_from_replay(
+                        replay_buffer,
+                        reward_stats_ptr,
+                        int(replay_buffer.ptr[0]),
+                        replay_source=replay_pipeline,
+                    )
                 if trace_recorder:
                     trace_recorder.add_slice(
                         "learner/update_reward_stats",

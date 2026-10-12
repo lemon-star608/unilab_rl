@@ -9,13 +9,14 @@ import numpy as np
 import torch
 
 from uni_rl.algos.common.collector_timing import extract_env_step_breakdown_timing_ms
-from uni_rl.env_contract import EnvFactory
+from uni_rl.env_contract import REPLAY_AUX_INFO_KEY, EnvFactory
 from uni_rl.offpolicy.actor_adapter import get_offpolicy_actor_adapter, import_actor_adapter_modules
 from uni_rl.offpolicy.coordination import (
     LearnerCoordinationState,
     LearnerPhase,
     learner_pid_is_alive,
 )
+from uni_rl.offpolicy.n_step import NStepRewardFold
 from uni_rl.offpolicy.tensor_metrics import TensorCollectorMetrics, TensorMetricFlush
 from uni_rl.offpolicy.thread_budget import apply_torch_thread_runtime
 from uni_rl.utils.device import configure_backend_process_device
@@ -45,6 +46,56 @@ INFERENCE_DEPENDENCY_GRAPH = {
     "reset_boundary": "terminal/reset rows are committed before observation[t+1]",
     "legal_concurrent_work": "replay/metrics work may overlap only after its transition is published",
 }
+
+
+def _per_env_metric_rewards(rewards: Any, num_envs: int) -> Any:
+    """Reduce per-step rewards to one scalar per env for episode metrics.
+
+    Episode metrics track a single scalar reward per env; multi-head rewards
+    are averaged over heads until per-head metric plumbing exists. Flat
+    single-head rewards pass through unchanged.
+    """
+    if rewards.ndim == 1:
+        return rewards
+    return rewards.reshape(num_envs, -1).mean(-1)
+
+
+def _emit_collector_transition(
+    transition: dict[str, Any],
+    *,
+    folder: NStepRewardFold | None,
+    reward_stats_ring: Any,
+    replay_add: Any,
+    stop_event: Any,
+) -> None:
+    """Publish raw reward stats, fold the n-step window, and write replay rows.
+
+    Raw per-step rewards/dones always go to the stats ring (the learner-side
+    reward normalizer tracks raw returns, never folded ones). The replay row
+    is the folded window output once the window fills; the first ``n_step -
+    1`` steps emit no row.
+    """
+    if reward_stats_ring is not None:
+        reward_stats_ring.publish(transition["rewards"], transition["dones"])
+    folded = folder.push(transition) if folder is not None else transition
+    if folded is None:
+        return
+    published = replay_add(
+        folded["obs"],
+        folded["actions"],
+        folded["rewards"],
+        folded["next_obs"],
+        folded["dones"],
+        folded["truncated"],
+        terminal_mask=folded["terminal_mask"],
+        terminal_next_obs=folded["terminal_next_obs"],
+        critic=folded["critic"],
+        next_critic=folded["next_critic"],
+        terminal_next_critic=folded["terminal_next_critic"],
+        aux=folded["aux"],
+    )
+    if not published and not stop_event.is_set():
+        raise RuntimeError("replay ingress closed before collector shutdown")
 
 
 def _inference_flight_metrics(inference_slot) -> tuple[int, int, int, int]:
@@ -255,6 +306,9 @@ def off_policy_collector_fn(
     backend_device_binder=None,
     learner_coordination: LearnerCoordinationState | None = None,
     learner_pid: int | None = None,
+    n_step: int = 1,
+    n_step_gamma: float = 0.99,
+    reward_stats_ring=None,
 ):
     """Entry point for the off-policy collector subprocess.
 
@@ -287,6 +341,9 @@ def off_policy_collector_fn(
         backend_device_binder=backend_device_binder,
         learner_coordination=learner_coordination,
         learner_pid=learner_pid,
+        n_step=n_step,
+        n_step_gamma=n_step_gamma,
+        reward_stats_ring=reward_stats_ring,
     )
 
 
@@ -316,6 +373,9 @@ def _run_collector(
     backend_device_binder=None,
     learner_coordination=None,
     learner_pid=None,
+    n_step=1,
+    n_step_gamma=0.99,
+    reward_stats_ring=None,
 ):
     # Spawn subprocesses do not inherit the parent's adapter registrations;
     # import the configured modules so registration side effects run here too.
@@ -632,6 +692,7 @@ def _run_collector(
 
     inference_tick = 0
     replay_add = replay_buffer.add_batch
+    n_step_folder = NStepRewardFold(n_step, n_step_gamma) if n_step > 1 else None
     # Collection loop
     try:
         while not stop_event.is_set():
@@ -777,13 +838,17 @@ def _run_collector(
             cycle_timing_ms.update(extract_env_step_breakdown_timing_ms(state.info))
 
             # Extract data as numpy
+            aux_t = None
+            aux_np = None
             if tensor_collector:
                 assert obs_t is not None
                 assert critic_t is not None
                 next_obs_t, next_critic_t = cast(
                     tuple[torch.Tensor, torch.Tensor], split_obs_dict(state.obs)
                 )
-                rewards_t = state.reward.to(dtype=torch.float32).ravel()
+                # Replay rows store reward heads as provided ((m,) or (m, H));
+                # the row schema validates the shape downstream.
+                rewards_t = state.reward.to(dtype=torch.float32)
                 truncated_t = state.truncated.to(dtype=torch.float32).ravel()
                 combined_dones_t = (state.terminated | state.truncated).to(dtype=torch.float32)
                 assert rewards_t is not None
@@ -793,10 +858,13 @@ def _run_collector(
                 done_mask_t = combined_dones_t > 0.5
                 assert tensor_metrics is not None
                 tensor_metrics.update(
-                    rewards_t,
+                    _per_env_metric_rewards(rewards_t, num_envs),
                     done_mask_t,
                     truncated_t > 0.5,
                 )
+                aux_t = state.info.get(REPLAY_AUX_INFO_KEY)
+                if aux_t is not None and not isinstance(aux_t, torch.Tensor):
+                    aux_t = torch.as_tensor(aux_t)
                 terminal_final = state.final_observation
                 if terminal_final is not None:
                     terminal_obs_t = terminal_final.get("obs")
@@ -808,7 +876,7 @@ def _run_collector(
                 next_obs_np, next_critic_np = split_obs_dict(state.obs)
                 next_obs_np = np.asarray(next_obs_np, dtype=np.float32)
                 next_critic_np = np.asarray(next_critic_np, dtype=np.float32)
-                rewards_np = np.asarray(state.reward, dtype=np.float32).ravel()
+                rewards_np = np.asarray(state.reward, dtype=np.float32)
                 truncated_np = state.truncated.astype(np.float32, copy=False).ravel()
                 combined_dones = (
                     (state.terminated | state.truncated).astype(np.float32, copy=False).ravel()
@@ -821,6 +889,7 @@ def _run_collector(
                 timeout_mask_np = truncated_np > 0.5
                 done_count_window += int(np.count_nonzero(done_mask_np))
                 timeout_count_window += int(np.count_nonzero(timeout_mask_np))
+                aux_np = state.info.get(REPLAY_AUX_INFO_KEY)
                 terminal_contract = resolve_terminal_observation_contract(
                     next_obs_batch_size=next_obs_np.shape[0],
                     final_observation=state.final_observation,
@@ -862,21 +931,26 @@ def _run_collector(
                 assert combined_dones_t is not None
                 assert truncated_t is not None
                 assert done_mask_t is not None
-                published = replay_add(
-                    obs_t,
-                    actions.to(dtype=torch.float32),
-                    rewards_t,
-                    next_obs_t,
-                    combined_dones_t,
-                    truncated_t,
-                    terminal_mask=done_mask_t,
-                    terminal_next_obs=terminal_obs_t,
-                    critic=critic_t,
-                    next_critic=next_critic_t,
-                    terminal_next_critic=terminal_critic_t,
+                _emit_collector_transition(
+                    {
+                        "obs": obs_t,
+                        "actions": actions.to(dtype=torch.float32),
+                        "rewards": rewards_t,
+                        "next_obs": next_obs_t,
+                        "dones": combined_dones_t,
+                        "truncated": truncated_t,
+                        "terminal_mask": done_mask_t,
+                        "terminal_next_obs": terminal_obs_t,
+                        "critic": critic_t,
+                        "next_critic": next_critic_t,
+                        "terminal_next_critic": terminal_critic_t,
+                        "aux": aux_t,
+                    },
+                    folder=n_step_folder,
+                    reward_stats_ring=reward_stats_ring,
+                    replay_add=replay_add,
+                    stop_event=stop_event,
                 )
-                if not published and not stop_event.is_set():
-                    raise RuntimeError("replay ingress closed before collector shutdown")
             else:
                 assert obs_np is not None
                 assert critic_np is not None
@@ -887,29 +961,36 @@ def _run_collector(
                 assert combined_dones is not None
                 assert truncated_np is not None
                 assert terminal_contract is not None
-                published = replay_add(
-                    torch.from_numpy(obs_np),
-                    torch.from_numpy(actions_np),
-                    torch.from_numpy(rewards_np),
-                    torch.from_numpy(next_obs_np),
-                    torch.from_numpy(combined_dones),
-                    torch.from_numpy(truncated_np),
-                    terminal_mask=torch.from_numpy(terminal_contract.terminal_mask),
-                    terminal_next_obs=(
-                        torch.from_numpy(terminal_contract.terminal_obs)
-                        if terminal_contract.terminal_obs is not None
-                        else None
-                    ),
-                    critic=torch.from_numpy(critic_np),
-                    next_critic=torch.from_numpy(next_critic_np),
-                    terminal_next_critic=(
-                        torch.from_numpy(terminal_contract.terminal_critic)
-                        if terminal_contract.terminal_critic is not None
-                        else None
-                    ),
+                _emit_collector_transition(
+                    {
+                        "obs": torch.from_numpy(obs_np),
+                        "actions": torch.from_numpy(actions_np),
+                        "rewards": torch.from_numpy(rewards_np),
+                        "next_obs": torch.from_numpy(next_obs_np),
+                        "dones": torch.from_numpy(combined_dones),
+                        "truncated": torch.from_numpy(truncated_np),
+                        "terminal_mask": torch.from_numpy(terminal_contract.terminal_mask),
+                        "terminal_next_obs": (
+                            torch.from_numpy(terminal_contract.terminal_obs)
+                            if terminal_contract.terminal_obs is not None
+                            else None
+                        ),
+                        "critic": torch.from_numpy(critic_np),
+                        "next_critic": torch.from_numpy(next_critic_np),
+                        "terminal_next_critic": (
+                            torch.from_numpy(terminal_contract.terminal_critic)
+                            if terminal_contract.terminal_critic is not None
+                            else None
+                        ),
+                        "aux": (
+                            torch.as_tensor(np.asarray(aux_np)) if aux_np is not None else None
+                        ),
+                    },
+                    folder=n_step_folder,
+                    reward_stats_ring=reward_stats_ring,
+                    replay_add=replay_add,
+                    stop_event=stop_event,
                 )
-                if not published and not stop_event.is_set():
-                    raise RuntimeError("replay ingress closed before collector shutdown")
             if trace_recorder:
                 trace_recorder.add_slice(
                     "collector/replay_add",
@@ -930,7 +1011,7 @@ def _run_collector(
                 assert combined_dones is not None
                 assert next_obs_np is not None
                 assert next_critic_np is not None
-                current_ep_rewards += rewards_np
+                current_ep_rewards += _per_env_metric_rewards(rewards_np, num_envs)
                 current_ep_lengths += 1
                 reset_mask = combined_dones > 0.5
                 reset_indices = np.where(reset_mask)[0]
