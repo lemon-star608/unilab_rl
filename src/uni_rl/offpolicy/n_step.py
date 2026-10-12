@@ -18,6 +18,13 @@ One env-vector transition is pushed per collector step; once the window holds
 - ``obs`` / ``actions`` / ``critic`` / ``aux``: passed through from the
   oldest transition (the row's own step).
 
+  Width-4 replay aux ``(motion_id, motion_step, next_motion_id,
+  next_motion_step)`` is the one exception: its first two columns describe the
+  row's own ``obs`` (oldest), while the next-context columns must follow the
+  span end exactly like ``next_obs``. Passing the oldest next-context through
+  unchanged would rebuild ``next_obs`` from a frame that is ``n_step - 1``
+  steps stale for every folded row.
+
 Multi-head rewards ``(m, H)`` fold head-wise with the episode mask broadcast
 over heads. The emitted terminal fields ride with the span end, so the
 buffer's ``_patch_terminal_next_observations`` keeps storing the true final
@@ -36,6 +43,7 @@ class NStepRewardFold:
     """Fold one n-step window of env-vector transitions per collector step."""
 
     _SPAN_END_FIELDS = ("dones", "truncated", "next_obs", "next_critic", "terminal_mask")
+    _AUX_WIDTH = 4
 
     def __init__(self, n_step: int, gamma: float) -> None:
         if isinstance(n_step, bool) or not isinstance(n_step, int) or n_step < 1:
@@ -74,6 +82,7 @@ class NStepRewardFold:
         }
         terminal_next_obs = newest["terminal_next_obs"]
         terminal_next_critic = newest["terminal_next_critic"]
+        next_aux = self._span_end_next_aux(newest)
 
         for index in reversed(range(self.n_step - 1)):
             transition = self._transitions[index]
@@ -102,8 +111,13 @@ class NStepRewardFold:
                     terminal_next_critic = transition["terminal_next_critic"].clone()
                 else:
                     terminal_next_critic[mask] = transition["terminal_next_critic"][mask]
+            if next_aux is not None:
+                next_aux[mask] = transition["aux"][mask, 2:4]
 
         oldest = self._transitions[0]
+        aux = oldest["aux"]
+        if next_aux is not None:
+            aux = torch.cat((oldest["aux"][:, 0:2], next_aux), dim=1)
         return {
             "obs": oldest["obs"],
             "actions": oldest["actions"],
@@ -116,5 +130,18 @@ class NStepRewardFold:
             "critic": oldest["critic"],
             "next_critic": span_end["next_critic"],
             "terminal_next_critic": terminal_next_critic,
-            "aux": oldest["aux"],
+            "aux": aux,
         }
+
+    @classmethod
+    def _span_end_next_aux(cls, newest: dict[str, Any]) -> torch.Tensor | None:
+        """Next-context aux columns for the span end; ``None`` for other widths.
+
+        Only the exact width-4 layout is folded. Width 2 keeps the
+        ``step + n_step`` fallback in the rebuilder, and other widths have no
+        next-context contract, so they pass through unchanged.
+        """
+        aux = newest["aux"]
+        if not isinstance(aux, torch.Tensor) or aux.ndim != 2 or aux.shape[1] != cls._AUX_WIDTH:
+            return None
+        return aux[:, 2:4].clone()

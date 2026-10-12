@@ -388,3 +388,109 @@ def test_emit_collector_transition_folds_and_publishes_stats() -> None:
     rewards, dones, read = ring.drain()
     assert read == 2
     assert torch.equal(rewards[:, 0, 0], torch.tensor([1.0, 2.0]))
+
+
+def _aux4(step: int, *, motion_id: int, next_step: int | None = None) -> torch.Tensor:
+    """Width-4 aux: [motion_id, step, motion_id, next_step] for every env row."""
+    tail = step + 1 if next_step is None else next_step
+    aux = torch.full((_M, 4), motion_id, dtype=torch.int32)
+    aux[:, 1] = step
+    aux[:, 3] = tail
+    return aux
+
+
+def _step_tensors_aux4(
+    step: int,
+    *,
+    motion_id: int,
+    dones: torch.Tensor,
+    next_step: int | None = None,
+) -> dict:
+    transition = _step_tensors(
+        step,
+        heads=1,
+        rewards=torch.ones(_M),
+        dones=dones,
+        truncated=torch.zeros(_M),
+        final_obs=None,
+    )
+    transition["aux"] = _aux4(step, motion_id=motion_id, next_step=next_step)
+    return transition
+
+
+def test_fold_width4_next_context_follows_span_end() -> None:
+    """Width-4 next-context columns must track the folded ``next_obs`` step.
+
+    A passthrough of the oldest transition's aux would leave ``next_motion_step``
+    at ``oldest_step + 1`` while ``next_obs`` comes from the newest transition,
+    rebuilding the terminal context ``n_step - 1`` frames stale.
+    """
+    n = 3
+    folder = NStepRewardFold(n, 0.99)
+    emitted = []
+    for step in range(n):
+        row = folder.push(_step_tensors_aux4(step, motion_id=7, dones=torch.zeros(_M)))
+        if row is not None:
+            emitted.append(row)
+
+    assert len(emitted) == 1
+    aux = emitted[0]["aux"]
+    assert aux.shape == (_M, 4)
+    # Columns 0:1 keep the oldest obs context; columns 2:3 carry the newest
+    # transition's next context (step n-1 advanced once by the env).
+    assert torch.equal(aux[:, 0], torch.full((_M,), 7, dtype=torch.int32))
+    assert torch.equal(aux[:, 1], torch.zeros(_M, dtype=torch.int32))
+    assert torch.equal(aux[:, 2], torch.full((_M,), 7, dtype=torch.int32))
+    assert torch.equal(aux[:, 3], torch.full((_M,), n, dtype=torch.int32))
+
+
+def test_fold_width4_next_context_follows_done_rows() -> None:
+    """A done mid-span rewrites the next context on exactly the done rows."""
+    n = 3
+    folder = NStepRewardFold(n, 0.99)
+    dones = torch.zeros(_M)
+    dones[1] = 1.0
+    # Oldest step: env1's next context describes the terminal pre-reset frame.
+    assert folder.push(
+        _step_tensors_aux4(0, motion_id=7, dones=dones.clone(), next_step=42)
+    ) is None
+    emitted = []
+    for step, motion_id in ((1, 9), (2, 10)):
+        row = folder.push(
+            _step_tensors_aux4(step, motion_id=motion_id, dones=torch.zeros(_M))
+        )
+        if row is not None:
+            emitted.append(row)
+
+    assert len(emitted) == 1
+    aux = emitted[0]["aux"]
+    # Non-done rows keep the newest transition's context (step 2 -> next 3).
+    assert aux[0, 0].item() == 7 and aux[0, 1].item() == 0
+    assert aux[0, 2].item() == 10 and aux[0, 3].item() == 3
+    # The done row keeps the done transition's terminal context and motion id.
+    assert aux[1, 0].item() == 7 and aux[1, 1].item() == 0
+    assert aux[1, 2].item() == 7 and aux[1, 3].item() == 42
+
+
+def test_fold_width2_aux_passthrough_is_unchanged() -> None:
+    """The 2-column layout has no next-context contract: keep the old passthrough."""
+    n = 2
+    folder = NStepRewardFold(n, 0.99)
+    emitted = []
+    for step in range(n):
+        row = folder.push(
+            _step_tensors(
+                step,
+                heads=1,
+                rewards=torch.ones(_M),
+                dones=torch.zeros(_M),
+                truncated=torch.zeros(_M),
+                final_obs=None,
+            )
+        )
+        if row is not None:
+            emitted.append(row)
+
+    assert len(emitted) == 1
+    assert emitted[0]["aux"].shape == (_M, 2)
+    assert torch.equal(emitted[0]["aux"], _aux4(0, motion_id=0)[:, 0:2])
