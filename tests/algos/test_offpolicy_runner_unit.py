@@ -573,6 +573,99 @@ def test_mjwarp_collector_start_forwards_learner_device(
     assert _FakeReplayBuffer.diagnostics_calls == 4
     assert runner.last_run_summary["status"] == "completed"
     assert runner.last_run_summary["metric_schema_version"] == METRIC_SCHEMA_VERSION
+
+
+def test_replay_ingress_transformer_keeps_full_ring_and_compact_buffer(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """Compaction splits the env/inference width from the replay row width."""
+    from uni_rl.ipc.row_schema import RowSchema
+
+    _FakePipeline.close_calls = 0
+    _FakeReplayBuffer.diagnostics_calls = 0
+    monkeypatch.setattr(device_runner_module, "ReplayBuffer", _FakeReplayBuffer)
+    monkeypatch.setattr(device_runner_module, "GPUResidentReplayPipeline", _FakePipeline)
+    monkeypatch.setattr(device_runner_module, "OffPolicyLogger", _FakeLogger)
+    monkeypatch.setattr(device_runner_module.torch, "save", lambda *args, **kwargs: None)
+    monkeypatch.setattr(device_runner_module.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        device_runner_module.torch.cuda, "mem_get_info", lambda device: (1 << 30, 2 << 30)
+    )
+
+    class _FakeInferenceRing:
+        nbytes = 1
+
+        def __init__(self, *args, **kwargs):
+            del args
+            self.device = torch.device(kwargs["device"])
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(device_runner_module, "SharedInferenceRing", _FakeInferenceRing)
+
+    real_empty = torch.empty
+
+    def empty_without_cuda(*args, **kwargs):
+        if str(kwargs.get("device", "")).startswith("cuda"):
+            kwargs["device"] = "cpu"
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setattr(device_runner_module.torch, "empty", empty_without_cuda)
+    monkeypatch.setattr(runner_module, "get_env_dims", lambda *args, **kwargs: (6, 2, 5))
+    monkeypatch.setattr(
+        device_runner_module, "require_offpolicy_replay_device", lambda value: value
+    )
+    runner = device_runner_module.DoubleBufferOffPolicyRunner(
+        learner=_Learner(),
+        env_name="DummyEnv",
+        algo_type="sac",
+        env_factory=_unused_env_factory,
+        num_envs=2,
+        replay_buffer_n=8,
+        batch_size=4,
+        learning_starts=0,
+        updates_per_step=1,
+        policy_frequency=1,
+        env_steps_per_sync=1,
+        device="cuda",
+        sim_backend="mujoco",
+        row_schema=RowSchema(obs_dim=3, action_dim=2, critic_dim=0, aux_width=2),
+        replay_ingress_transformer="tests.algos.test_offpolicy_runner_unit:noop_factory",
+        replay_ingress_transformer_params={"replay_obs_dim": 3},
+    )
+    monkeypatch.setattr(runner, "_prepare_inference_timing_events", lambda: None)
+    monkeypatch.setattr(runner, "_dp_init_broadcast", lambda: None)
+    monkeypatch.setattr(runner, "_prepare_learner", lambda **kwargs: None)
+    collector_kwargs = {}
+
+    def capture_collector(*, target_fn, kwargs):
+        del target_fn
+        collector_kwargs.update(kwargs)
+
+    monkeypatch.setattr(runner, "_start_collector", capture_collector)
+    runner.learn(max_iterations=0, save_interval=0, log_dir=str(tmp_path))
+
+    # The inference ring follows the env (6), while replay rows follow the
+    # compact schema (3); the collector receives both facts.
+    assert runner.obs_dim == 6
+    assert _FakeReplayBuffer.last_kwargs["obs_dim"] == 3
+    assert _FakeReplayBuffer.last_kwargs["critic_dim"] == 0
+    assert collector_kwargs["replay_ingress_transformer"] == (
+        "tests.algos.test_offpolicy_runner_unit:noop_factory"
+    )
+    assert collector_kwargs["replay_ingress_transformer_params"] == {"replay_obs_dim": 3}
+    assert runner.runtime_manifest["replay_obs_dim"] == 3
+    assert runner.runtime_manifest["replay_critic_dim"] == 0
+    assert runner.runtime_manifest["replay_ingress_transformer"] == (
+        "tests.algos.test_offpolicy_runner_unit:noop_factory"
+    )
+
+
+def noop_factory(params):
+    del params
+    return lambda transition: transition
     assert (
         runner.last_run_summary["runtime_manifest"]["schema_version"]
         == RUNTIME_MANIFEST_SCHEMA_VERSION

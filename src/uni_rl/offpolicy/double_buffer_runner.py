@@ -192,6 +192,8 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         replay_pipeline_factory: Callable[..., GPUResidentReplayPipeline] | None = None,
         row_schema: RowSchema | None = None,
         replay_storage_owner: str = "gpu",
+        replay_ingress_transformer: str | Callable | None = None,
+        replay_ingress_transformer_params: Mapping[str, Any] | None = None,
         n_step: int = 1,
         reconstruct_next_obs: bool = False,
         target_frequency: int = 1,
@@ -369,6 +371,20 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         self.backend_device_binder = backend_device_binder
         self.replay_pipeline_factory = replay_pipeline_factory
         self.row_schema = row_schema
+        # Optional full-obs -> compact-row compaction at the collector ingress
+        # boundary. The path is resolved in the collector process (spawn-safe);
+        # the env and actor inference ring keep the full observation width.
+        if (
+            replay_ingress_transformer is not None
+            and not isinstance(replay_ingress_transformer, str)
+            and not callable(replay_ingress_transformer)
+        ):
+            raise TypeError(
+                "replay_ingress_transformer must be a dotted path or callable, got "
+                f"{replay_ingress_transformer!r}"
+            )
+        self.replay_ingress_transformer = replay_ingress_transformer
+        self.replay_ingress_transformer_params = replay_ingress_transformer_params
         if replay_storage_owner not in ("gpu", "cpu"):
             raise ValueError(
                 f"replay_storage_owner must be 'gpu' or 'cpu', got {replay_storage_owner!r}"
@@ -423,6 +439,17 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             "learner_device": self.inference_placement.learner_device,
             "inference_staging_policy": self.inference_placement.staging_policy,
             "inference_ring_capacity": self.inference_slot_capacity,
+            "replay_ingress_transformer": (
+                None
+                if self.replay_ingress_transformer is None
+                else str(self.replay_ingress_transformer)
+            ),
+            "replay_obs_dim": (
+                self.row_schema.obs_dim if self.row_schema is not None else self.obs_dim
+            ),
+            "replay_critic_dim": (
+                self.row_schema.critic_dim if self.row_schema is not None else self.critic_obs_dim
+            ),
             "runtime_limits": self.tensor_runtime_settings.manifest(),
             "inference_flight": {
                 "queue_depth": 0,
@@ -1576,12 +1603,19 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         self._shutdown_recorder.set_phase(owner="learner", phase="startup/replay_resources")
         # --- bounded collector ingress (the complete ring lives on device) ---
         buffer_capacity = self.replay_buffer_n * self.num_envs
+        # With collector-side compaction the replay row width (row schema)
+        # is narrower than the env/inference observation width; the buffer
+        # owns the compact rows, the inference ring keeps full observations.
+        buffer_obs_dim = self.row_schema.obs_dim if self.row_schema is not None else self.obs_dim
+        buffer_critic_dim = (
+            self.row_schema.critic_dim if self.row_schema is not None else self.critic_obs_dim
+        )
         replay_buffer = ReplayBuffer(
             capacity=buffer_capacity,
-            obs_dim=self.obs_dim,
+            obs_dim=buffer_obs_dim,
             action_dim=self.action_dim,
             device=self.device,
-            critic_dim=self.critic_obs_dim,
+            critic_dim=buffer_critic_dim,
             ingress_slot_rows=self.replay_ingress_slot_rows,
             ingress_depth=self.replay_ingress_depth,
             ingress_device=self.device if gpu_centric_collector else "cpu",
@@ -1794,6 +1828,8 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 "learner_coordination": self._learner_coordination,
                 "learner_pid": os.getpid(),
                 "n_step": self.n_step,
+                "replay_ingress_transformer": self.replay_ingress_transformer,
+                "replay_ingress_transformer_params": self.replay_ingress_transformer_params,
                 # The fold discount must equal the learner's TD discount; only
                 # read it when folding is active so gamma-less custom learners
                 # keep working at n_step=1.

@@ -17,6 +17,7 @@ from uni_rl.offpolicy.coordination import (
     learner_pid_is_alive,
 )
 from uni_rl.offpolicy.n_step import NStepRewardFold
+from uni_rl.offpolicy.runtime import resolve_dotted_callable
 from uni_rl.offpolicy.tensor_metrics import TensorCollectorMetrics, TensorMetricFlush
 from uni_rl.offpolicy.thread_budget import apply_torch_thread_runtime
 from uni_rl.utils.device import configure_backend_process_device
@@ -67,6 +68,7 @@ def _emit_collector_transition(
     reward_stats_ring: Any,
     replay_add: Any,
     stop_event: Any,
+    ingress_transformer: Any = None,
 ) -> None:
     """Publish raw reward stats, fold the n-step window, and write replay rows.
 
@@ -77,6 +79,12 @@ def _emit_collector_transition(
     """
     if reward_stats_ring is not None:
         reward_stats_ring.publish(transition["rewards"], transition["dones"])
+    if ingress_transformer is not None:
+        # Full env observations compact to the replay row schema here; rewards,
+        # flags, and aux pass through so raw reward accounting and bootstrap
+        # encoding stay exact. The buffer's schema validation fails closed on
+        # any width mismatch after the transform.
+        transition = ingress_transformer(transition)
     folded = folder.push(transition) if folder is not None else transition
     if folded is None:
         return
@@ -376,10 +384,25 @@ def _run_collector(
     n_step=1,
     n_step_gamma=0.99,
     reward_stats_ring=None,
+    replay_ingress_transformer=None,
+    replay_ingress_transformer_params=None,
 ):
     # Spawn subprocesses do not inherit the parent's adapter registrations;
     # import the configured modules so registration side effects run here too.
     import_actor_adapter_modules(actor_adapter_modules)
+    ingress_transformer = None
+    if replay_ingress_transformer is not None:
+        transformer_factory = (
+            replay_ingress_transformer
+            if callable(replay_ingress_transformer)
+            else resolve_dotted_callable(str(replay_ingress_transformer))
+        )
+        ingress_transformer = transformer_factory(replay_ingress_transformer_params or {})
+        if not callable(ingress_transformer):
+            raise TypeError(
+                "replay_ingress_transformer factory must return a callable, got "
+                f"{type(ingress_transformer).__name__}"
+            )
     apply_torch_thread_runtime(torch_thread_runtime, role="collector", torch_module=torch)
     configured_backend_device = configure_backend_process_device(
         sim_backend, backend_device, bind_device=backend_device_binder
@@ -970,6 +993,7 @@ def _run_collector(
                     reward_stats_ring=reward_stats_ring,
                     replay_add=replay_add,
                     stop_event=stop_event,
+                    ingress_transformer=ingress_transformer,
                 )
             else:
                 assert obs_np is not None
@@ -1010,6 +1034,7 @@ def _run_collector(
                     reward_stats_ring=reward_stats_ring,
                     replay_add=replay_add,
                     stop_event=stop_event,
+                    ingress_transformer=ingress_transformer,
                 )
             if trace_recorder:
                 trace_recorder.add_slice(

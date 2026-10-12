@@ -660,6 +660,27 @@ def stub_sample_rebuilder(batch: dict[str, Any], *, indices: Any, device: Any) -
     return batch
 
 
+def stub_ingress_transformer_factory(params: Any) -> Any:
+    del params
+
+    def transform(transition: dict[str, Any]) -> dict[str, Any]:
+        out = dict(transition)
+        for key in (
+            "obs",
+            "next_obs",
+            "critic",
+            "next_critic",
+            "terminal_next_obs",
+            "terminal_next_critic",
+        ):
+            value = out.get(key)
+            if value is not None:
+                out[key] = value[..., ::2]
+        return out
+
+    return transform
+
+
 def test_flashsac_builder_selects_layered_replay_storage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -793,4 +814,103 @@ def test_flashsac_builder_rejects_reconstruction_without_layered_storage(
     cfg = _flashsac_cfg()
     cfg.algo.algo_params.replay_reconstruct_next_obs = True
     with pytest.raises(ValueError, match="cpu_layered"):
+        _build_flashsac_runner(cfg)
+
+
+def test_flashsac_builder_wires_replay_ingress_transformer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uni_rl.algos.flash_sac.double_buffer as module
+
+    _patch_flashsac_builder(module, monkeypatch)
+
+    cfg = _flashsac_cfg()
+    cfg.algo.algo_params.replay_ingress_transformer = f"{__name__}:stub_ingress_transformer_factory"
+    cfg.algo.algo_params.replay_obs_dim = 2
+    cfg.algo.algo_params.replay_critic_dim = 3
+    cfg.algo.algo_params.replay_aux_width = 2
+    runner = _build_flashsac_runner(cfg)
+
+    # The env keeps the full width (learner/ring stay 4/6); replay rows store
+    # the compact projection declared by the owner config.
+    assert runner.kwargs["row_schema"].obs_dim == 2
+    assert runner.kwargs["row_schema"].critic_dim == 3
+    assert runner.kwargs["row_schema"].aux_width == 2
+    assert _FakeLearner.last_kwargs["obs_dim"] == 4
+    assert _FakeLearner.last_kwargs["critic_obs_dim"] == 6
+    assert (
+        runner.kwargs["replay_ingress_transformer"]
+        == f"{__name__}:stub_ingress_transformer_factory"
+    )
+    assert runner.kwargs["replay_ingress_transformer_params"]["replay_obs_dim"] == 2
+    assert runner.kwargs["replay_ingress_transformer_params"]["replay_critic_dim"] == 3
+
+
+def test_flashsac_builder_rejects_transformer_without_replay_obs_dim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uni_rl.algos.flash_sac.double_buffer as module
+
+    _patch_flashsac_builder(module, monkeypatch)
+
+    cfg = _flashsac_cfg()
+    cfg.algo.algo_params.replay_ingress_transformer = f"{__name__}:stub_ingress_transformer_factory"
+    with pytest.raises(ValueError, match="replay_obs_dim"):
+        _build_flashsac_runner(cfg)
+
+
+def test_flashsac_builder_rejects_replay_width_without_transformer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uni_rl.algos.flash_sac.double_buffer as module
+
+    _patch_flashsac_builder(module, monkeypatch)
+
+    cfg = _flashsac_cfg()
+    cfg.algo.algo_params.replay_obs_dim = 2
+    with pytest.raises(ValueError, match="replay_ingress_transformer"):
+        _build_flashsac_runner(cfg)
+
+
+def test_flashsac_builder_rejects_wider_replay_obs_than_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uni_rl.algos.flash_sac.double_buffer as module
+
+    _patch_flashsac_builder(module, monkeypatch)
+
+    cfg = _flashsac_cfg()
+    cfg.algo.algo_params.replay_ingress_transformer = f"{__name__}:stub_ingress_transformer_factory"
+    cfg.algo.algo_params.replay_obs_dim = 5
+    cfg.algo.algo_params.replay_critic_dim = 3
+    with pytest.raises(ValueError, match=r"replay_obs_dim must be in \(0, 4\]"):
+        _build_flashsac_runner(cfg)
+
+
+def test_flashsac_builder_rejects_transformer_without_replay_critic_dim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uni_rl.algos.flash_sac.double_buffer as module
+
+    _patch_flashsac_builder(module, monkeypatch)
+
+    cfg = _flashsac_cfg()
+    cfg.algo.algo_params.replay_ingress_transformer = f"{__name__}:stub_ingress_transformer_factory"
+    cfg.algo.algo_params.replay_obs_dim = 2
+    with pytest.raises(ValueError, match="replay_critic_dim"):
+        _build_flashsac_runner(cfg)
+
+
+def test_flashsac_builder_rejects_wider_replay_critic_than_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uni_rl.algos.flash_sac.double_buffer as module
+
+    _patch_flashsac_builder(module, monkeypatch)
+
+    cfg = _flashsac_cfg()
+    cfg.algo.algo_params.replay_ingress_transformer = f"{__name__}:stub_ingress_transformer_factory"
+    cfg.algo.algo_params.replay_obs_dim = 2
+    cfg.algo.algo_params.replay_critic_dim = 7
+    with pytest.raises(ValueError, match=r"replay_critic_dim must be an integer in \(0, 6\]"):
         _build_flashsac_runner(cfg)

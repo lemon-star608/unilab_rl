@@ -138,13 +138,59 @@ def build_flashsac_double_buffer_runner(
         if custom_runtime.algo_type is not None:
             algo_type = str(custom_runtime.algo_type)
 
+    # Optional collector-side replay-ingress compaction: the env/inference
+    # ring keeps the full observation width while replay rows store a compact
+    # projection produced by the transformer factory (resolved in the collector
+    # process; the sample-side rebuilder expands rows again before the learner).
+    ingress_transformer_path = _algo_param(cfg.algo, "replay_ingress_transformer", None)
+    replay_obs_dim = _algo_param(cfg.algo, "replay_obs_dim", None)
+    replay_critic_dim = _algo_param(cfg.algo, "replay_critic_dim", None)
+    if ingress_transformer_path not in (None, ""):
+        resolve_dotted_callable(str(ingress_transformer_path))
+        if replay_obs_dim is None:
+            raise ValueError(
+                "algo.algo_params.replay_ingress_transformer requires "
+                "algo.algo_params.replay_obs_dim"
+            )
+        if isinstance(replay_obs_dim, bool) or not isinstance(replay_obs_dim, int):
+            raise ValueError(f"replay_obs_dim must be an integer, got {replay_obs_dim!r}")
+        if not 0 < replay_obs_dim <= obs_dim:
+            raise ValueError(
+                f"replay_obs_dim must be in (0, {obs_dim}] (env obs width), got {replay_obs_dim!r}"
+            )
+        if critic_obs_dim > 0:
+            if replay_critic_dim is None:
+                raise ValueError(
+                    "algo.algo_params.replay_ingress_transformer with a critic "
+                    "observation requires algo.algo_params.replay_critic_dim"
+                )
+            if (
+                isinstance(replay_critic_dim, bool)
+                or not isinstance(replay_critic_dim, int)
+                or not 0 < replay_critic_dim <= critic_obs_dim
+            ):
+                raise ValueError(
+                    f"replay_critic_dim must be an integer in (0, {critic_obs_dim}], "
+                    f"got {replay_critic_dim!r}"
+                )
+        elif replay_critic_dim not in (None, 0):
+            raise ValueError(
+                "algo.algo_params.replay_critic_dim requires the env to expose a "
+                "separate critic observation"
+            )
+    elif replay_obs_dim is not None or replay_critic_dim is not None:
+        raise ValueError(
+            "algo.algo_params.replay_obs_dim/replay_critic_dim are replay-row "
+            "widths and require algo.algo_params.replay_ingress_transformer"
+        )
+
     # Row layout is generated from owner YAML and travels with the run config:
     # scalar reward (H=1), no aux columns, and fp32 storage reproduce the
     # historical packed layout bit for bit.
     row_schema = RowSchema(
-        obs_dim=obs_dim,
+        obs_dim=obs_dim if replay_obs_dim is None else int(replay_obs_dim),
         action_dim=action_dim,
-        critic_dim=critic_obs_dim,
+        critic_dim=critic_obs_dim if replay_critic_dim is None else int(replay_critic_dim),
         reward_heads=int(_algo_param(cfg.algo, "reward_head_count", 1)),
         aux_width=int(_algo_param(cfg.algo, "replay_aux_width", 0)),
         float_dtype=_algo_param(cfg.algo, "replay_float_dtype", "fp32"),
@@ -295,6 +341,17 @@ def build_flashsac_double_buffer_runner(
         log_interval=int(cfg.training.log_interval),
         row_schema=row_schema,
         replay_storage_owner=replay_storage_owner,
+        replay_ingress_transformer=(
+            None if ingress_transformer_path in (None, "") else str(ingress_transformer_path)
+        ),
+        replay_ingress_transformer_params=(
+            None
+            if ingress_transformer_path in (None, "")
+            else cast(
+                dict[str, Any],
+                OmegaConf.to_container(cfg.algo.algo_params, resolve=True),
+            )
+        ),
         n_step=int(cfg.algo.algo_params.n_step),
         reconstruct_next_obs=reconstruct_next_obs,
         replay_pipeline_factory=replay_pipeline_factory,

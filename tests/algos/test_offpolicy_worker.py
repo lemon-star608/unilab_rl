@@ -14,6 +14,7 @@ import torch
 import uni_rl.offpolicy.worker as worker_module
 from uni_rl.algos.common.collector_timing import extract_env_step_breakdown_timing_ms
 from uni_rl.algos.flash_sac.update import compute_categorical_td_target
+from uni_rl.env_contract import REPLAY_AUX_INFO_KEY
 from uni_rl.ipc.inference_ring import SharedInferenceRing
 from uni_rl.logging.metrics_drain import RewardComponentWindow, drain_collector_metrics
 from uni_rl.logging.offpolicy import OffPolicyLogger
@@ -1694,3 +1695,176 @@ def test_collector_encodes_bootstrap_eligible_truncation(
     torch.testing.assert_close(targets[1], torch.tensor([1.0, 0.0, 0.0]))  # failure
     torch.testing.assert_close(targets[2], torch.tensor([0.0, 0.0, 1.0]))  # timeout
     torch.testing.assert_close(targets[3], torch.tensor([1.0, 0.0, 0.0]))  # overlap
+
+
+def _halving_ingress_transformer_factory(params):
+    del params
+
+    def transform(transition):
+        out = dict(transition)
+        for key in (
+            "obs",
+            "next_obs",
+            "critic",
+            "next_critic",
+            "terminal_next_obs",
+            "terminal_next_critic",
+        ):
+            value = out.get(key)
+            if value is not None:
+                out[key] = value[..., ::2]
+        return out
+
+    return transform
+
+
+@pytest.mark.parametrize("n_step", [1, 2])
+def test_collector_compacts_full_obs_before_replay_ingress(
+    monkeypatch: pytest.MonkeyPatch,
+    n_step: int,
+) -> None:
+    """The ingress transformer sees full env obs; replay rows store compact obs.
+
+    The env and inference ring keep the full 6/4-dimensional actor/critic
+    observation; the transformer factory (resolved in the collector process)
+    halves observation-bearing columns before the n-step fold and the replay
+    write. Rewards, flags, aux, and raw reward-stats accounting must pass
+    through untouched.
+    """
+    from uni_rl.ipc.reward_stats_ring import RawRewardStatsRing
+
+    stop_event = threading.Event()
+    metrics_queue: queue.Queue[dict] = queue.Queue(maxsize=8)
+    replay_rows: list[tuple[tuple[torch.Tensor, ...], dict[str, object]]] = []
+
+    n_envs, full_obs_dim, full_critic_dim = 2, 6, 4
+    n_steps = n_step + 1
+    reward_script = torch.arange(1.0, float(n_steps) + 1.0).unsqueeze(1).repeat(1, n_envs)
+    aux_script = torch.stack(
+        [
+            torch.arange(n_steps, dtype=torch.int64).unsqueeze(1).expand(n_steps, n_envs),
+            torch.arange(100, 100 + n_steps, dtype=torch.int64)
+            .unsqueeze(1)
+            .expand(n_steps, n_envs),
+        ],
+        dim=-1,
+    )
+    env_obs = [torch.full((n_envs, full_obs_dim), float(t)) for t in range(n_steps + 1)]
+    env_critic = [torch.full((n_envs, full_critic_dim), float(t) + 0.5) for t in range(n_steps + 1)]
+    final_obs = torch.full((n_envs, full_obs_dim), 99.0)
+
+    class _Env:
+        def __init__(self) -> None:
+            self.t = 0
+            self.state = SimpleNamespace(
+                obs={"obs": env_obs[0], "critic": env_critic[0]},
+                reward=torch.zeros(n_envs),
+                terminated=torch.zeros(n_envs, dtype=torch.bool),
+                truncated=torch.zeros(n_envs, dtype=torch.bool),
+                final_observation=None,
+                info={},
+            )
+
+        def step(self, actions):
+            del actions
+            t = self.t
+            done = t == n_steps - 1
+            self.state = SimpleNamespace(
+                obs={"obs": env_obs[t + 1], "critic": env_critic[t + 1]},
+                reward=reward_script[t],
+                terminated=torch.full((n_envs,), done, dtype=torch.bool),
+                truncated=torch.zeros(n_envs, dtype=torch.bool),
+                final_observation={"obs": final_obs, "critic": final_obs[..., :full_critic_dim]},
+                info={REPLAY_AUX_INFO_KEY: aux_script[t]},
+            )
+            self.t += 1
+            if self.t >= n_steps:
+                stop_event.set()
+            return self.state
+
+        def close(self):
+            return None
+
+    class _ReplayBuffer:
+        trace_recorder = None
+        trace_thread_time = False
+        size = torch.zeros(1, dtype=torch.int64)
+
+        def attach_stop_event(self, stop) -> None:
+            del stop
+
+        def add_batch(self, *args, **kwargs) -> bool:
+            replay_rows.append((args, kwargs))
+            return True
+
+        def release_ipc(self) -> None:
+            return None
+
+    monkeypatch.setattr(worker_module, "apply_torch_thread_runtime", lambda *a, **kw: None)
+    monkeypatch.setattr(worker_module, "apply_training_seed", lambda *a, **kw: None)
+    ring_ipc = SharedInferenceRing(n_envs, full_obs_dim, full_obs_dim, capacity=4)
+
+    def serve_learner_action(coordination_queue, tick_id, stop, **kwargs):
+        del coordination_queue, stop, kwargs
+        ring_ipc.copy_observation_to(
+            tick_id=tick_id,
+            observations=torch.zeros(n_envs, full_obs_dim),
+            dones=torch.zeros(n_envs),
+            epoch=0,
+        )
+        ring_ipc.publish_action(
+            tick_id=tick_id,
+            policy_version=0,
+            actions=torch.zeros(n_envs, full_obs_dim),
+            epoch=0,
+        )
+        return True
+
+    monkeypatch.setattr(worker_module, "_wait_for_inference_tick", serve_learner_action)
+    stats_ring = RawRewardStatsRing(num_envs=n_envs, reward_heads=1, depth=16)
+    worker_module._run_collector(
+        stop_event=stop_event,
+        env_factory=lambda num_envs, env_cfg_override=None: _Env(),
+        num_envs=n_envs,
+        replay_buffer=_ReplayBuffer(),
+        inference_slot=ring_ipc,
+        inference_request_queue=queue.Queue(),
+        inference_response_queue=queue.Queue(),
+        algo_type="flashsac",
+        actor_adapter_modules=None,
+        metrics_queue=metrics_queue,
+        inference_transport="legacy_tensor",
+        sim_backend="mujoco",
+        backend_device=None,
+        env_cfg_override=None,
+        seed=1,
+        trace_enabled=False,
+        trace_thread_time=False,
+        n_step=n_step,
+        n_step_gamma=0.99,
+        reward_stats_ring=stats_ring,
+        replay_ingress_transformer=_halving_ingress_transformer_factory,
+        replay_ingress_transformer_params={"replay_obs_dim": full_obs_dim // 2},
+    )
+
+    assert len(replay_rows) == n_steps - n_step + 1
+    for args, kwargs in replay_rows:
+        obs, actions, rewards, next_obs, dones, truncated = args
+        del actions, dones, truncated
+        assert obs.shape == (n_envs, full_obs_dim // 2)
+        assert next_obs.shape == (n_envs, full_obs_dim // 2)
+        assert kwargs["critic"].shape == (n_envs, full_critic_dim // 2)
+        assert kwargs["next_critic"].shape == (n_envs, full_critic_dim // 2)
+        assert kwargs["terminal_next_obs"].shape == (n_envs, full_obs_dim // 2)
+        assert kwargs["terminal_next_critic"].shape == (n_envs, full_critic_dim // 2)
+        assert kwargs["aux"].shape == (n_envs, 2)
+        assert kwargs["aux"].dtype == torch.int64
+        # Rewards and flags pass through the compaction boundary unchanged.
+        assert rewards.ndim == 1
+
+    # Raw reward stats see every full-width env step, never compact columns.
+    raw_rewards, raw_dones, read = stats_ring.drain()
+    assert read == n_steps
+    assert raw_rewards.shape == (n_steps, n_envs, 1)
+    assert torch.equal(raw_rewards[:, :, 0], reward_script)
+    assert raw_dones.sum() == float(n_envs)
