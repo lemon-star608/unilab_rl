@@ -18,6 +18,28 @@ def _as_slab_list(packed: "torch.Tensor | list[torch.Tensor]") -> "list[torch.Te
     return packed if isinstance(packed, list) else [packed]
 
 
+def _fit_storage_dtype(values: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Cast float rows to a replay storage dtype, saturating fp16 overflow.
+
+    Values beyond the fp16 range (and +-Inf) would otherwise be stored as
+    +-Inf, and a single non-finite row poisons every categorical TD target
+    that samples it. Other dtypes are a plain cast (fp32 rows stay
+    bit-identical).
+    """
+    if dtype is torch.float16 and values.is_floating_point() and values.dtype is not torch.float16:
+        limit = torch.finfo(torch.float16).max
+        return values.clamp(-limit, limit).to(dtype)
+    return values.to(dtype)
+
+
+def _store_rows(view: torch.Tensor, values: torch.Tensor) -> None:
+    """Copy rows into a replay field view through :func:`_fit_storage_dtype`."""
+    if view.dtype is torch.float16:
+        view.copy_(_fit_storage_dtype(values, view.dtype))
+    else:
+        view.copy_(values)
+
+
 class ReplayBuffer(SharedBufferBase):
     """Bounded host ingress for an authoritative device replay ring.
 
@@ -635,9 +657,9 @@ class ReplayBuffer(SharedBufferBase):
         *,
         has_critic: bool,
     ) -> None:
-        self._field_write_view(targets, "obs", obs.shape[0]).copy_(obs)
-        self._field_write_view(targets, "next_obs", obs.shape[0]).copy_(next_obs)
-        self._field_write_view(targets, "actions", obs.shape[0]).copy_(actions)
+        _store_rows(self._field_write_view(targets, "obs", obs.shape[0]), obs)
+        _store_rows(self._field_write_view(targets, "next_obs", obs.shape[0]), next_obs)
+        _store_rows(self._field_write_view(targets, "actions", obs.shape[0]), actions)
         self._field_write_view(targets, "rewards", obs.shape[0]).copy_(rewards)
         self._field_write_view(targets, "dones", obs.shape[0]).copy_(
             dones.unsqueeze(1),
@@ -648,8 +670,8 @@ class ReplayBuffer(SharedBufferBase):
         if has_critic:
             assert critic is not None
             assert next_critic is not None
-            self._field_write_view(targets, "critic", obs.shape[0]).copy_(critic)
-            self._field_write_view(targets, "next_critic", obs.shape[0]).copy_(next_critic)
+            _store_rows(self._field_write_view(targets, "critic", obs.shape[0]), critic)
+            _store_rows(self._field_write_view(targets, "next_critic", obs.shape[0]), next_critic)
         if self._schema.aux_width > 0:
             aux_view = self._field_write_view(targets, "aux", obs.shape[0])
             if aux is None:
@@ -672,11 +694,13 @@ class ReplayBuffer(SharedBufferBase):
         if not torch.any(terminal_mask):
             return
 
-        target_next_obs[terminal_mask] = terminal_next_obs[terminal_mask].to(target_next_obs.dtype)
+        target_next_obs[terminal_mask] = _fit_storage_dtype(
+            terminal_next_obs[terminal_mask], target_next_obs.dtype
+        )
 
         if target_next_critic is not None and terminal_next_critic is not None:
-            target_next_critic[terminal_mask] = terminal_next_critic[terminal_mask].to(
-                target_next_critic.dtype
+            target_next_critic[terminal_mask] = _fit_storage_dtype(
+                terminal_next_critic[terminal_mask], target_next_critic.dtype
             )
 
     def field_view(

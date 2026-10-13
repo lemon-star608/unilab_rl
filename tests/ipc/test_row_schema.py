@@ -405,3 +405,50 @@ def test_without_next_obs_drops_only_the_next_groups() -> None:
 def test_store_next_obs_flag_is_validated() -> None:
     with pytest.raises(ValueError, match="store_next_obs"):
         RowSchema(obs_dim=_OBS_DIM, action_dim=_ACTION_DIM, store_next_obs=1)  # type: ignore[arg-type]
+
+
+def test_fp16_rows_saturate_overflow_instead_of_storing_inf() -> None:
+    # A finite fp32 value beyond the fp16 range (or an Inf from an exploding
+    # world) must not land in fp16 replay as Inf: one non-finite row poisons
+    # every later categorical TD target that samples it. fp32 rows are stored
+    # unchanged.
+    big = torch.finfo(torch.float16).max
+    for float_dtype in ("fp16", "fp32"):
+        schema = RowSchema(
+            obs_dim=_OBS_DIM,
+            action_dim=_ACTION_DIM,
+            critic_dim=_CRITIC_DIM,
+            float_dtype=float_dtype,
+        )
+        buf = _schema_buffer(schema)
+        n = 4
+        batch = _pattern_batch(n, 1)
+        batch["obs"][0, 0] = 1.0e6
+        batch["next_obs"][1, 1] = float("inf")
+        batch["critic"][2, 0] = -1.0e7
+        terminal_mask = torch.tensor([False, False, False, True])
+        terminal_obs = torch.full((n, _OBS_DIM), -float("inf"))
+        assert buf.add(
+            batch["obs"],
+            batch["actions"],
+            batch["rewards"].squeeze(1).contiguous(),
+            batch["next_obs"],
+            batch["dones"],
+            batch["truncated"],
+            critic=batch["critic"],
+            next_critic=batch["next_critic"],
+            terminal_mask=terminal_mask,
+            terminal_next_obs=terminal_obs,
+        )
+        slot, start, count, packed = _take(buf)
+        obs = buf.field_view(packed, "obs").float()
+        next_obs = buf.field_view(packed, "next_obs").float()
+        critic = buf.field_view(packed, "critic").float()
+        if float_dtype == "fp16":
+            assert obs[0, 0] == big and next_obs[1, 1] == big and critic[2, 0] == -big
+            assert bool((next_obs[3] == -big).all())
+            assert torch.equal(obs[1:], batch["obs"][1:])  # in-range values are unchanged
+        else:
+            assert obs[0, 0] == 1.0e6 and next_obs[1, 1] == float("inf") and critic[2, 0] == -1.0e7
+        buf.commit_ingress(slot=slot, start=start, count=count)
+        buf.close()
