@@ -54,7 +54,9 @@ def test_final_observation_falls_back_to_info_dict():
 
     np.testing.assert_array_equal(terminal_contract.terminal_mask, np.array([True, False]))
     np.testing.assert_array_equal(terminal_contract.terminal_obs, final_obs["obs"])
-    assert terminal_contract.terminal_critic is None
+    # No critic group: the critic row is the actor obs, so its terminal patch
+    # must be the terminal actor obs (a None here left next_critic unpatched).
+    np.testing.assert_array_equal(terminal_contract.terminal_critic, final_obs["obs"])
 
 
 def test_terminal_mask_falls_back_to_info_flag_and_done_shape_mismatch_is_zeroed():

@@ -80,8 +80,16 @@ class NStepRewardFold:
             name: newest[name].clone() if newest[name] is not None else None
             for name in self._SPAN_END_FIELDS
         }
-        terminal_next_obs = newest["terminal_next_obs"]
-        terminal_next_critic = newest["terminal_next_critic"]
+        # Clone: the masked writes below must not edit the window's own
+        # entry, which later spans read as an older transition.
+        terminal_next_obs = (
+            newest["terminal_next_obs"].clone() if newest["terminal_next_obs"] is not None else None
+        )
+        terminal_next_critic = (
+            newest["terminal_next_critic"].clone()
+            if newest["terminal_next_critic"] is not None
+            else None
+        )
         next_aux = self._span_end_next_aux(newest)
 
         for index in reversed(range(self.n_step - 1)):

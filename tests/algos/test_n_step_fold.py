@@ -89,7 +89,10 @@ def _reference_fold(steps: list[dict], n: int, gamma: float) -> list[dict]:
             name: steps[emit_t][name].clone()
             for name in ("dones", "truncated", "next_obs", "next_critic", "terminal_mask")
         }
+        # Clone like the upstream fold: masked writes must not edit steps[].
         terminal_next_obs = steps[emit_t]["terminal_next_obs"]
+        if terminal_next_obs is not None:
+            terminal_next_obs = terminal_next_obs.clone()
         for index in reversed(range(start, emit_t)):
             done = steps[index]["dones"]
             if row["rewards"].ndim == 2:
@@ -197,6 +200,39 @@ def test_fold_chain_stops_at_first_done() -> None:
     )
     assert torch.equal(row["rewards"][0], want0)
     assert row["dones"][0] == 0.0
+
+
+def test_fold_two_dones_within_window_keep_their_own_terminal_obs() -> None:
+    # Env 0 ends an episode at t=2 and again at t=4, inside one n=5 window.
+    # Folding the span that starts at t=0 must not overwrite the window's t=4
+    # entry with the t=2 terminal obs: the span starting at t=3 ends at t=4
+    # and needs that step's own terminal obs.
+    n, gamma = 5, 0.9
+    folder = NStepRewardFold(n, gamma)
+    steps = []
+    for t in range(8):
+        dones = torch.zeros(_M)
+        if t in (2, 4):
+            dones[0] = 1.0
+        final_obs = torch.full((_M, _OBS_DIM), float(t) + 5000.0) if dones.any() else None
+        steps.append(
+            _step_tensors(
+                t,
+                heads=1,
+                rewards=torch.ones(_M),
+                dones=dones,
+                truncated=torch.zeros(_M),
+                final_obs=final_obs,
+            )
+        )
+    rows = [row for row in (folder.push(transition) for transition in steps) if row is not None]
+    assert len(rows) == 4
+    # Spans starting at t=0..2 end at the t=2 done; span t=3 ends at t=4.
+    for start, end in ((0, 2), (1, 2), (2, 2), (3, 4)):
+        row = rows[start]
+        assert row["dones"][0] == 1.0
+        assert torch.equal(row["terminal_next_obs"][0], torch.full((_OBS_DIM,), end + 5000.0))
+        assert torch.equal(row["terminal_next_critic"][0], torch.full((_CRITIC_DIM,), end + 5000.0))
 
 
 def test_fold_early_done_truncates_tail_rewards() -> None:
@@ -451,14 +487,12 @@ def test_fold_width4_next_context_follows_done_rows() -> None:
     dones = torch.zeros(_M)
     dones[1] = 1.0
     # Oldest step: env1's next context describes the terminal pre-reset frame.
-    assert folder.push(
-        _step_tensors_aux4(0, motion_id=7, dones=dones.clone(), next_step=42)
-    ) is None
+    assert (
+        folder.push(_step_tensors_aux4(0, motion_id=7, dones=dones.clone(), next_step=42)) is None
+    )
     emitted = []
     for step, motion_id in ((1, 9), (2, 10)):
-        row = folder.push(
-            _step_tensors_aux4(step, motion_id=motion_id, dones=torch.zeros(_M))
-        )
+        row = folder.push(_step_tensors_aux4(step, motion_id=motion_id, dones=torch.zeros(_M)))
         if row is not None:
             emitted.append(row)
 

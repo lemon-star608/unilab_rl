@@ -1540,6 +1540,11 @@ def test_tensor_collector_folds_n_step_rows_and_publishes_raw_stats(
                 terminal_next_obs = kwargs["terminal_next_obs"]
                 assert terminal_next_obs is not None
                 assert torch.equal(terminal_next_obs[env], final_obs_script[end_step][env])
+                # No critic group: the critic row falls back to the actor obs,
+                # so its terminal patch must carry the same final obs.
+                terminal_next_critic = kwargs["terminal_next_critic"]
+                assert terminal_next_critic is not None
+                assert torch.equal(terminal_next_critic[env], final_obs_script[end_step][env])
             else:
                 assert dones[env] == 0.0
                 assert torch.equal(next_obs[env], env_obs[step + n_steps][env])
@@ -1679,6 +1684,11 @@ def test_collector_encodes_bootstrap_eligible_truncation(
     # by the encoded `truncated` column.
     assert torch.equal(kwargs["terminal_mask"], torch.tensor([False, True, True, True]))
     assert torch.equal(kwargs["terminal_next_obs"], torch.from_numpy(final_obs))
+    # The env publishes no critic group, so replay's critic row is the actor
+    # obs; a timeout row's next_critic must be patched with the same final
+    # obs, not left as the post-reset observation of the next episode.
+    assert torch.equal(kwargs["next_critic"], torch.ones((n_envs, obs_dim)))
+    assert torch.equal(kwargs["terminal_next_critic"], torch.from_numpy(final_obs))
 
     support = torch.tensor([0.0, 1.0, 2.0])
     target_log_probs = torch.log(torch.tensor([[0.0, 0.0, 1.0]] * n_envs).clamp_min(1e-8))

@@ -37,7 +37,9 @@ def resolve_terminal_observation_contract(
     terminal_critic: np.ndarray | None = None
     if np.any(terminal_mask) and isinstance(resolved_final_observation, dict):
         terminal_obs = resolved_final_observation.get("obs")
-        terminal_critic = resolved_final_observation.get("critic")
+        # Without a critic group the critic row is the actor obs (see
+        # split_obs_dict), so the terminal critic is the terminal actor obs.
+        terminal_critic = resolved_final_observation.get("critic", terminal_obs)
 
     timeout_terminal_mask = terminal_mask
     if truncated is not None:

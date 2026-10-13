@@ -8,9 +8,11 @@ normalizer). This tiny shared ring carries them: the collector publishes one
 it in order once per training iteration.
 
 The channel is single-writer single-reader over process-shared tensors. A
-full ring must never stall collection, so overflow drops the oldest
-unpublished step and counts the drop in ``dropped`` (statistics skew is
-bounded and visible); the depth default covers long learner stalls.
+full ring must never stall collection, so overflow drops the step being
+published (the writer never moves the reader's pointer) and counts it in
+``dropped``. A dropped step leaves a gap in the normalizer's running-return
+recursion, so the skew is bounded and visible rather than silent; the depth
+default covers long learner stalls and warmups up to ``depth`` ticks.
 """
 
 from __future__ import annotations

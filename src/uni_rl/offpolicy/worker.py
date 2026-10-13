@@ -908,7 +908,10 @@ def _run_collector(
                 terminal_final = state.final_observation
                 if terminal_final is not None:
                     terminal_obs_t = terminal_final.get("obs")
-                    terminal_critic_t = terminal_final.get("critic")
+                    # Same fallback as split_obs_dict: without a critic group
+                    # the critic row is the actor obs, so its terminal patch is
+                    # the terminal actor obs (not the post-reset observation).
+                    terminal_critic_t = terminal_final.get("critic", terminal_obs_t)
                 else:
                     terminal_obs_t = None
                     terminal_critic_t = None
