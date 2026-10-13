@@ -648,6 +648,23 @@ def test_flashsac_builder_builds_row_schema_from_owner_config(
     assert _FakeLearner.last_kwargs["reward_head_count"] == 2
 
 
+def test_flashsac_builder_accepts_zero_width_shared_critic_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uni_rl.algos.flash_sac.double_buffer as module
+
+    _patch_flashsac_builder(module, monkeypatch)
+
+    cfg = _flashsac_cfg()
+    cfg.algo.algo_params.replay_ingress_transformer = f"{__name__}:stub_ingress_transformer_factory"
+    cfg.algo.algo_params.replay_obs_dim = 2
+    cfg.algo.algo_params.replay_critic_dim = 0
+    runner = _build_flashsac_runner(cfg)
+
+    assert runner.kwargs["row_schema"].critic_dim == 0
+    assert not runner.kwargs["row_schema"].has_field("critic")
+
+
 def test_flashsac_builder_rejects_invalid_row_schema_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -918,5 +935,5 @@ def test_flashsac_builder_rejects_wider_replay_critic_than_env(
     cfg.algo.algo_params.replay_ingress_transformer = f"{__name__}:stub_ingress_transformer_factory"
     cfg.algo.algo_params.replay_obs_dim = 2
     cfg.algo.algo_params.replay_critic_dim = 7
-    with pytest.raises(ValueError, match=r"replay_critic_dim must be an integer in \(0, 6\]"):
+    with pytest.raises(ValueError, match=r"replay_critic_dim must be an integer in \[0, 6\]"):
         _build_flashsac_runner(cfg)

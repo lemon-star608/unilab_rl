@@ -167,10 +167,10 @@ def build_flashsac_double_buffer_runner(
             if (
                 isinstance(replay_critic_dim, bool)
                 or not isinstance(replay_critic_dim, int)
-                or not 0 < replay_critic_dim <= critic_obs_dim
+                or not 0 <= replay_critic_dim <= critic_obs_dim
             ):
                 raise ValueError(
-                    f"replay_critic_dim must be an integer in (0, {critic_obs_dim}], "
+                    f"replay_critic_dim must be an integer in [0, {critic_obs_dim}], "
                     f"got {replay_critic_dim!r}"
                 )
         elif replay_critic_dim not in (None, 0):
@@ -342,7 +342,9 @@ def build_flashsac_double_buffer_runner(
         log_interval=int(cfg.training.log_interval),
         row_schema=row_schema,
         random_action_warmup=bool(_algo_param(cfg.algo, "random_action_warmup", False)),
-        random_action_warmup_range=_algo_param(cfg.algo, "random_action_warmup_range", (-1.0, 1.0)),
+        random_action_warmup_range=list(
+            _algo_param(cfg.algo, "random_action_warmup_range", (-1.0, 1.0))
+        ),
         replay_storage_owner=replay_storage_owner,
         replay_ingress_transformer=(
             None if ingress_transformer_path in (None, "") else str(ingress_transformer_path)
