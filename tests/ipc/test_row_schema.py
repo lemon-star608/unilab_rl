@@ -95,6 +95,34 @@ def test_fp16_schema_stratifies_float_slabs() -> None:
     )
 
 
+def test_fp16_schema_can_store_actions_in_fp32() -> None:
+    schema = RowSchema(
+        obs_dim=_OBS_DIM,
+        action_dim=_ACTION_DIM,
+        critic_dim=_CRITIC_DIM,
+        reward_heads=2,
+        aux_width=2,
+        float_dtype="fp16",
+        action_float_dtype="fp32",
+    )
+
+    assert [slab.dtype for slab in schema.slabs] == [
+        torch.float16,
+        torch.float32,
+        torch.float16,
+        torch.int32,
+    ]
+    assert schema.field("actions").dtype is torch.float32
+    assert schema.field("actions").slab == 1
+    assert schema.field("rewards").slab == 1
+    assert (
+        schema.storage_row_bytes
+        == 2 * _OBS_DIM * 2 + (_ACTION_DIM + 4) * 4 + 2 * _CRITIC_DIM * 2 + 2 * 4
+    )
+    assert schema.without_next_obs().action_float_dtype is torch.float32
+    assert schema.summary()["action_float_dtype"] == "float32"
+
+
 @pytest.mark.parametrize(
     ("kwargs", "match"),
     [
@@ -106,6 +134,7 @@ def test_fp16_schema_stratifies_float_slabs() -> None:
         ({"obs_dim": 8.0, "action_dim": 3}, "obs_dim must be an integer"),
         ({"obs_dim": 8, "action_dim": 3, "float_dtype": "bf16"}, "fp32"),
         ({"obs_dim": 8, "action_dim": 3, "float_dtype": torch.bfloat16}, "fp32"),
+        ({"obs_dim": 8, "action_dim": 3, "action_float_dtype": "bf16"}, "fp32"),
     ],
 )
 def test_schema_rejects_invalid_declarations(kwargs: dict, match: str) -> None:
@@ -274,6 +303,44 @@ def test_fp16_buffer_casts_float_groups_and_keeps_rewards_fp32() -> None:
     assert torch.equal(buf.field_view(packed, "actions"), batch["actions"].to(torch.float16))
     assert torch.equal(buf.field_view(packed, "rewards"), batch["rewards"])
     assert torch.equal(buf.field_view(packed, "critic"), batch["critic"].to(torch.float16))
+    buf.commit_ingress(slot=slot, start=start, count=count)
+    buf.close()
+
+
+def test_fp16_buffer_can_preserve_actions_in_fp32() -> None:
+    schema = RowSchema(
+        obs_dim=_OBS_DIM,
+        action_dim=_ACTION_DIM,
+        critic_dim=_CRITIC_DIM,
+        reward_heads=2,
+        aux_width=2,
+        float_dtype="fp16",
+        action_float_dtype="fp32",
+    )
+    buf = _schema_buffer(schema)
+    n = 4
+    batch = _pattern_batch(n, 2)
+    # These values are not exactly representable in fp16.
+    batch["actions"] = torch.tensor(
+        [[1.0 / 3.0, 1.0 / 7.0, 1.0 / 9.0]] * n,
+        dtype=torch.float32,
+    )
+    aux = torch.ones(n, 2, dtype=torch.int32)
+    assert buf.add(
+        batch["obs"],
+        batch["actions"],
+        batch["rewards"],
+        batch["next_obs"],
+        batch["dones"],
+        batch["truncated"],
+        critic=batch["critic"],
+        next_critic=batch["next_critic"],
+        aux=aux,
+    )
+    slot, start, count, packed = _take(buf)
+    assert buf.field_view(packed, "actions").dtype is torch.float32
+    assert torch.equal(buf.field_view(packed, "actions"), batch["actions"])
+    assert torch.equal(buf.field_view(packed, "obs"), batch["obs"].to(torch.float16))
     buf.commit_ingress(slot=slot, start=start, count=count)
     buf.close()
 

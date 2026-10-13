@@ -8,9 +8,10 @@ storage slab (one tensor per slab). The default schema (``reward_heads=1``,
 ``aux_width=0``, ``float_dtype=torch.float32``) therefore produces exactly
 the historical single fp32 slab with the historical column offsets.
 
-- ``obs`` / ``next_obs`` / ``actions`` / ``critic`` / ``next_critic`` store in
-  the configurable ``float_dtype`` (fp32 default, fp16 for compressed runs)
-  and are read back as fp32.
+- ``obs`` / ``next_obs`` / ``critic`` / ``next_critic`` store in the
+  configurable ``float_dtype`` (fp32 default, fp16 for compressed runs);
+  ``actions`` can optionally retain fp32 with ``action_float_dtype``. All
+  fields are read back as fp32.
 - ``rewards`` stores ``reward_heads`` fp32 columns (per-head rewards; H=1 is
   the historical scalar column).
 - ``dones`` / ``truncated`` stay the two historical fp32 flag columns.
@@ -95,6 +96,7 @@ class RowSchema:
         reward_heads: int = 1,
         aux_width: int = 0,
         float_dtype: str | torch.dtype = torch.float32,
+        action_float_dtype: str | torch.dtype | None = None,
         store_next_obs: bool = True,
     ) -> None:
         if not isinstance(store_next_obs, bool):
@@ -125,6 +127,11 @@ class RowSchema:
         self.reward_heads = reward_heads
         self.aux_width = aux_width
         self.float_dtype = resolve_float_dtype(float_dtype)
+        self.action_float_dtype = (
+            self.float_dtype
+            if action_float_dtype is None
+            else resolve_float_dtype(action_float_dtype)
+        )
         self.store_next_obs = store_next_obs
 
         widths: dict[str, int] = {
@@ -144,9 +151,9 @@ class RowSchema:
             widths["next_critic"] = 0
 
         dtypes: dict[str, torch.dtype] = {
-            name: self.float_dtype
-            for name in ("obs", "next_obs", "actions", "critic", "next_critic")
+            name: self.float_dtype for name in ("obs", "next_obs", "critic", "next_critic")
         }
+        dtypes["actions"] = self.action_float_dtype
         dtypes["rewards"] = torch.float32
         dtypes["dones"] = torch.float32
         dtypes["truncated"] = torch.float32
@@ -237,6 +244,7 @@ class RowSchema:
             reward_heads=self.reward_heads,
             aux_width=self.aux_width,
             float_dtype=self.float_dtype,
+            action_float_dtype=self.action_float_dtype,
             store_next_obs=False,
         )
 
@@ -249,6 +257,7 @@ class RowSchema:
             "reward_heads": self.reward_heads,
             "aux_width": self.aux_width,
             "float_dtype": str(self.float_dtype).removeprefix("torch."),
+            "action_float_dtype": str(self.action_float_dtype).removeprefix("torch."),
             "store_next_obs": self.store_next_obs,
             "storage_width": self._storage_width,
             "storage_row_bytes": self._storage_row_bytes,

@@ -2385,6 +2385,54 @@ def test_learner_inference_matches_existing_actor_exploration(algo_type: str) ->
         torch.testing.assert_close(actor._repeat_target, expected_actor._repeat_target)
 
 
+def test_random_action_warmup_replaces_policy_before_train_start() -> None:
+    actor = SimpleNamespace(
+        explore=lambda obs, dones, deterministic=False: obs[:, :2] + 100.0,
+    )
+    runner = object.__new__(device_runner_module.DoubleBufferOffPolicyRunner)
+    runner.device = "cpu"
+    runner.obs_dim = 3
+    runner.action_dim = 2
+    runner.obs_normalization = False
+    runner.algo_type = "sac"
+    runner.learner = SimpleNamespace(actor=actor)
+    runner.inference_epoch = 0
+    runner.random_action_warmup = True
+    runner.random_action_warmup_range = (-2.0, -1.0)
+    runner.random_action_warmup_ticks = 2
+    runner.inference_placement = InferencePlacement(
+        mode=InferenceTransport.CPU,
+        env_device="cpu",
+        ring_device="cpu",
+        learner_device="cpu",
+        collector_tensor_native=False,
+        staging_policy="cpu_no_device_transfer",
+    )
+    observations = np.zeros((2, 3), dtype=np.float32)
+    dones = np.zeros(2, dtype=np.float32)
+    slot = SharedInferenceRing(2, 3, 2, capacity=4)
+    for tick_id in (0, 1, 2):
+        slot.publish_observation(tick_id=tick_id, observations=observations, dones=dones, epoch=0)
+        runner._serve_learner_inference(
+            slot,
+            tick_id=tick_id,
+            policy_version=0,
+            obs_device=torch.empty(2, 3),
+            dones_device=torch.empty(2),
+            actor_obs_device=torch.empty(2, 3),
+            actor_dones_device=torch.empty(2),
+            actions_host=torch.empty(2, 2),
+            trace_recorder=None,
+        )
+    random_actions, _ = slot.consume_action(tick_id=0, epoch=0)
+    slot.consume_action(tick_id=1, epoch=0)
+    policy_actions, _ = slot.consume_action(tick_id=2, epoch=0)
+
+    random_actions = torch.from_numpy(random_actions)
+    assert bool((random_actions >= -2.0).all()) and bool((random_actions < -1.0).all())
+    torch.testing.assert_close(torch.from_numpy(policy_actions), torch.full((2, 2), 100.0))
+
+
 def test_adapter_learner_inference_uses_actor_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

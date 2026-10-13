@@ -194,6 +194,7 @@ def build_flashsac_double_buffer_runner(
         reward_heads=int(_algo_param(cfg.algo, "reward_head_count", 1)),
         aux_width=int(_algo_param(cfg.algo, "replay_aux_width", 0)),
         float_dtype=_algo_param(cfg.algo, "replay_float_dtype", "fp32"),
+        action_float_dtype=_algo_param(cfg.algo, "replay_action_float_dtype", None),
     )
 
     learner_kwargs = {
@@ -340,6 +341,8 @@ def build_flashsac_double_buffer_runner(
         tensor_runtime_settings=tensor_runtime_settings,
         log_interval=int(cfg.training.log_interval),
         row_schema=row_schema,
+        random_action_warmup=bool(_algo_param(cfg.algo, "random_action_warmup", False)),
+        random_action_warmup_range=_algo_param(cfg.algo, "random_action_warmup_range", (-1.0, 1.0)),
         replay_storage_owner=replay_storage_owner,
         replay_ingress_transformer=(
             None if ingress_transformer_path in (None, "") else str(ingress_transformer_path)

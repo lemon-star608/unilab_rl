@@ -623,12 +623,16 @@ def test_flashsac_builder_builds_row_schema_from_owner_config(
     cfg.algo.algo_params.reward_head_count = 2
     cfg.algo.algo_params.replay_aux_width = 2
     cfg.algo.algo_params.replay_float_dtype = "fp16"
+    cfg.algo.algo_params.replay_action_float_dtype = "fp32"
+    cfg.algo.algo_params.random_action_warmup = True
+    cfg.algo.algo_params.random_action_warmup_range = [-1.0, 1.0]
     runner = _build_flashsac_runner(cfg)
 
     row_schema = runner.kwargs["row_schema"]
     assert row_schema.reward_heads == 2
     assert row_schema.aux_width == 2
     assert row_schema.float_dtype is torch.float16
+    assert row_schema.action_float_dtype is torch.float32
     assert row_schema.obs_dim == 4
     assert row_schema.action_dim == 2
     assert row_schema.critic_dim == 6
@@ -638,7 +642,9 @@ def test_flashsac_builder_builds_row_schema_from_owner_config(
         torch.float16,
         torch.int32,
     ]
-    # obs/next_obs/actions | rewards+flags | critic/next_critic | aux
+    # obs/next_obs | actions+rewards+flags | critic/next_critic | aux
+    assert runner.kwargs["random_action_warmup"] is True
+    assert runner.kwargs["random_action_warmup_range"] == [-1.0, 1.0]
     assert _FakeLearner.last_kwargs["reward_head_count"] == 2
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import queue as queue_module
 import statistics
@@ -180,6 +181,9 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
     """Single-device off-policy runner with a double-buffered device batch."""
 
     REPLAY_BATCH_READY_POLL_SEC = 0.001
+    random_action_warmup = False
+    random_action_warmup_ticks = 0
+    random_action_warmup_range = (-1.0, 1.0)
 
     def __init__(
         self,
@@ -192,6 +196,8 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         backend_device_binder: Callable[[str], str | None] | None = None,
         replay_pipeline_factory: Callable[..., GPUResidentReplayPipeline] | None = None,
         row_schema: RowSchema | None = None,
+        random_action_warmup: bool = False,
+        random_action_warmup_range: tuple[float, float] | list[float] = (-1.0, 1.0),
         replay_storage_owner: str = "gpu",
         replay_ingress_transformer: str | Callable | None = None,
         replay_ingress_transformer_params: Mapping[str, Any] | None = None,
@@ -372,6 +378,31 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         self.backend_device_binder = backend_device_binder
         self.replay_pipeline_factory = replay_pipeline_factory
         self.row_schema = row_schema
+        if not isinstance(random_action_warmup, bool):
+            raise ValueError(f"random_action_warmup must be boolean, got {random_action_warmup!r}")
+        if (
+            not isinstance(random_action_warmup_range, (tuple, list))
+            or len(random_action_warmup_range) != 2
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                for value in random_action_warmup_range
+            )
+            or float(random_action_warmup_range[0]) >= float(random_action_warmup_range[1])
+        ):
+            raise ValueError(
+                "random_action_warmup_range must be two finite numbers [low, high] "
+                f"with low < high, got {random_action_warmup_range!r}"
+            )
+        self.random_action_warmup = random_action_warmup
+        self.random_action_warmup_range = (
+            float(random_action_warmup_range[0]),
+            float(random_action_warmup_range[1]),
+        )
+        self.random_action_warmup_ticks = (
+            int(self.train_start_threshold) + int(self.num_envs) - 1
+        ) // int(self.num_envs)
         # Optional full-obs -> compact-row compaction at the collector ingress
         # boundary. The path is resolved in the collector process (spawn-safe);
         # the env and actor inference ring keep the full observation width.
@@ -451,6 +482,11 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             "replay_critic_dim": (
                 self.row_schema.critic_dim if self.row_schema is not None else self.critic_obs_dim
             ),
+            "random_action_warmup": {
+                "enabled": self.random_action_warmup,
+                "ticks": self.random_action_warmup_ticks,
+                "range": list(self.random_action_warmup_range),
+            },
             "runtime_limits": self.tensor_runtime_settings.manifest(),
             "inference_flight": {
                 "queue_depth": 0,
@@ -1209,6 +1245,9 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         if self.obs_normalization:
             actor_obs = self.learner.obs_normalizer(actor_obs, update=False)
         forward_start_ns = time.perf_counter_ns()
+        use_random_warmup = self.random_action_warmup and int(tick_id) < int(
+            self.random_action_warmup_ticks
+        )
         cuda_forward_events: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
         if device.type == "cuda":
             cuda_forward_events = getattr(self, "_inference_forward_cuda_events", None)
@@ -1216,13 +1255,21 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 raise RuntimeError("CUDA inference timing events were not prepared at startup")
             cuda_forward_events[0].record(torch.cuda.current_stream(device))
         with torch.no_grad():
-            actions_device = sample_offpolicy_actions(
-                actor=self.learner.actor,
-                algo_type=self.algo_type,
-                obs_torch=actor_obs,
-                prev_dones_torch=actor_dones_device,
-                priv_info_torch=actor_context,
-            )
+            if use_random_warmup:
+                low, high = self.random_action_warmup_range
+                actions_device = torch.rand(
+                    (actor_obs.shape[0], self.action_dim),
+                    device=actor_obs.device,
+                    dtype=torch.float32,
+                ) * float(high - low) + float(low)
+            else:
+                actions_device = sample_offpolicy_actions(
+                    actor=self.learner.actor,
+                    algo_type=self.algo_type,
+                    obs_torch=actor_obs,
+                    prev_dones_torch=actor_dones_device,
+                    priv_info_torch=actor_context,
+                )
         if cuda_forward_events is not None:
             cuda_forward_events[1].record(torch.cuda.current_stream(device))
         elif device.type == "mps":
