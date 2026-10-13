@@ -543,6 +543,33 @@ METRIC_FAMILIES: dict[str, MetricFamilySpec] = {
             ),
             distributed_aggregation="cross-rank mean of per-rank report means",
         ),
+        MetricFamilySpec(
+            prefix="Policy/temperature_side",
+            owner="learner",
+            unit="alpha (dimensionless)",
+            aggregation="mean over learner updates since the previous report",
+            step_axis=_STEP_AXIS,
+            description=(
+                "Per-side entropy temperature emitted by side-factored actors "
+                "(one tag per hand side: Policy/temperature_side0, ...), "
+                "complementing the scalar Policy/temperature."
+            ),
+            distributed_aggregation="cross-rank mean of per-rank update means",
+        ),
+        MetricFamilySpec(
+            prefix="Loss/critic_head",
+            owner="learner",
+            unit="loss (nats)",
+            aggregation="mean over learner updates since the previous report",
+            step_axis=_STEP_AXIS,
+            description=(
+                "Per-reward-head categorical-critic loss emitted by multi-head "
+                "learners (one tag per head: Loss/critic_head0, ...). The "
+                "family prefix keeps the canonical schema open to any head "
+                "count without per-head registry entries."
+            ),
+            distributed_aggregation="cross-rank mean of per-rank update means",
+        ),
     )
 }
 
