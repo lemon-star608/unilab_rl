@@ -46,6 +46,7 @@ from uni_rl.offpolicy.runner import (
     build_offpolicy_sample_info,
     drain_raw_reward_stats,
     replay_buffer_ready_for_learning,
+    require_train_start_reachable,
 )
 from uni_rl.offpolicy.shutdown_diagnostics import ShutdownDiagnosticsRecorder
 from uni_rl.offpolicy.thread_budget import (
@@ -1502,6 +1503,9 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         iteration = 0
         start_iteration = self.resume_start_iteration
 
+        require_train_start_reachable(
+            self.train_start_threshold, self.replay_buffer_n * self.num_envs
+        )
         self._shutdown_recorder.set_phase(owner="learner", phase="startup/memory_budget")
         # --- memory budget check ---
         from uni_rl.ipc.memory_budget import (

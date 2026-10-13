@@ -32,6 +32,7 @@ from uni_rl.offpolicy.runner import (
     build_offpolicy_sample_info,
     compute_train_start_threshold,
     replay_buffer_ready_for_learning,
+    require_train_start_reachable,
     update_reward_stats_from_replay,
 )
 from uni_rl.utils.tensor_runtime import (
@@ -72,6 +73,23 @@ def test_replay_ready_contract(size, batch_size, learning_starts, num_envs, expe
         )
         is expected
     )
+
+
+@pytest.mark.parametrize(
+    ("threshold", "capacity"),
+    [(8, 8), (12, 64), (0, 0)],
+)
+def test_train_start_threshold_reachable_within_capacity(threshold, capacity):
+    require_train_start_reachable(threshold, capacity)
+
+
+def test_train_start_threshold_beyond_capacity_fails_closed():
+    # learning_starts counts vector ticks (rows = ticks * num_envs); passing a
+    # row count here at 2048 envs once made the learner wait forever on a
+    # replay buffer whose size saturates at capacity.
+    threshold = compute_train_start_threshold(1024, 2 * 2048, 2048)
+    with pytest.raises(ValueError, match="never start"):
+        require_train_start_reachable(threshold, 64 * 2048)
 
 
 def test_multi_step_scheduler_keeps_one_policy_version_until_update_boundary() -> None:

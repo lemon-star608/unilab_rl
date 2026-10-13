@@ -21,6 +21,23 @@ def compute_train_start_threshold(batch_size: int, learning_starts: int, num_env
     return max(int(batch_size), max(int(learning_starts), 0) * max(int(num_envs), 1), 0)
 
 
+def require_train_start_reachable(train_start_threshold: int, replay_capacity: int) -> None:
+    """Fail closed when the learner start threshold exceeds the replay capacity.
+
+    Replay size saturates at capacity, so an unreachable threshold would make
+    the learner serve inference forever without a single update.
+    ``learning_starts`` counts vector ticks: the threshold in rows is
+    ``max(batch_size, learning_starts * num_envs)``.
+    """
+    if int(train_start_threshold) > int(replay_capacity):
+        raise ValueError(
+            f"learner would never start: train start threshold {int(train_start_threshold)} "
+            f"rows exceeds replay capacity {int(replay_capacity)} rows "
+            "(threshold = max(batch_size, learning_starts * num_envs); "
+            "capacity = replay_buffer_n * num_envs; learning_starts counts vector ticks)"
+        )
+
+
 def replay_buffer_ready_for_learning(
     replay_buffer_size: int,
     *,
