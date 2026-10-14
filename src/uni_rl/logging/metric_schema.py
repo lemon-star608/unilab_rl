@@ -570,6 +570,19 @@ METRIC_FAMILIES: dict[str, MetricFamilySpec] = {
             ),
             distributed_aggregation="cross-rank mean of per-rank update means",
         ),
+        MetricFamilySpec(
+            prefix="Eval/",
+            owner="runner/evaluation",
+            unit="metric-specific",
+            aggregation="latest periodic evaluation result returned by a runner iteration hook",
+            step_axis=_STEP_AXIS,
+            description=(
+                "Owner-defined deterministic evaluation scalars. Values are "
+                "sparse on the iteration axis and retain their last reported "
+                "state between evaluation points."
+            ),
+            distributed_aggregation="cross-rank mean of per-rank evaluations",
+        ),
     )
 }
 

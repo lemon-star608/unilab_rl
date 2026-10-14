@@ -158,6 +158,7 @@ def build_sac_double_buffer_runner(
         learner_prepare_hook=(
             custom_runtime.learner_prepare_hook if custom_runtime is not None else None
         ),
+        iteration_hook=(custom_runtime.iteration_hook if custom_runtime is not None else None),
         backend_device_binder=backend_device_binder,
         actor_adapter_modules=actor_adapter_modules,
         inference_placement=inference_placement,

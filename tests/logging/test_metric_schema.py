@@ -61,6 +61,7 @@ def test_per_head_critic_loss_family_is_canonical() -> None:
     """Multi-head learners emit one Loss/critic_head<h> tag per reward head."""
     metrics = {f"Loss/critic_head{h}": float(h + 1) for h in range(3)}
     metrics.update({f"Policy/temperature_side{h}": 0.01 for h in range(2)})
+    metrics.update({"Eval/success_rate_obj_1.0": 1.0})
     assert normalize_metric_map(metrics) == metrics
 
 
@@ -98,7 +99,12 @@ def test_schema_is_closed_except_reward_terms() -> None:
         ["Loss/surrogate", "reward/term", "Train/rollouts_read", "Perf/learner_inference_ms"]
     )
 
-    assert set(METRIC_FAMILIES) == {"reward/", "Loss/critic_head", "Policy/temperature_side"}
+    assert set(METRIC_FAMILIES) == {
+        "reward/",
+        "Loss/critic_head",
+        "Policy/temperature_side",
+        "Eval/",
+    }
     assert "Perf/learner_other_ms" not in METRIC_SPECS
     assert "Train/staging_pool_capacity" not in METRIC_SPECS
     assert "Train/updates" not in METRIC_SPECS

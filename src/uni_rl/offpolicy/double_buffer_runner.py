@@ -193,6 +193,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         dp_sync: DpParameterSync | None = None,
         inference_request_timeout_sec: float | None = None,
         learner_prepare_hook: Callable[[Any, OffPolicyWarmupContext], None] | None = None,
+        iteration_hook: Callable[..., dict[str, float] | None] | None = None,
         backend_device_binder: Callable[[str], str | None] | None = None,
         replay_pipeline_factory: Callable[..., GPUResidentReplayPipeline] | None = None,
         row_schema: RowSchema | None = None,
@@ -300,6 +301,9 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         # Kept only for source-compatible construction. It is
         # intentionally not retained as a latency SLA anywhere in the runtime.
         self.learner_prepare_hook = learner_prepare_hook
+        if iteration_hook is not None and not callable(iteration_hook):
+            raise TypeError(f"iteration_hook must be callable or None, got {iteration_hook!r}")
+        self.iteration_hook = iteration_hook
         self.target_frequency = max(int(target_frequency), 1)
         self.policy_before_critic = bool(policy_before_critic)
         # Per-rank CPU block owned by this rank's collector (multi-GPU DP);
@@ -2353,8 +2357,18 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                         category="replay",
                     )
 
-                iteration_time = time.perf_counter() - iteration_start
+                if self.iteration_hook is not None:
+                    hook_metrics = self.iteration_hook(
+                        self,
+                        iteration,
+                        iteration * self.num_envs * self.env_steps_per_sync,
+                        log_dir,
+                    )
+                    if hook_metrics:
+                        for key, value in hook_metrics.items():
+                            iter_metrics[str(key)].append(float(value))
 
+                iteration_time = time.perf_counter() - iteration_start
                 write_delta = int(replay_buffer.ptr[0]) - ptr_before
                 consume = self.batch_size * self.updates_per_step
                 write_read_ema = 0.9 * write_read_ema + 0.1 * (write_delta / max(consume, 1))

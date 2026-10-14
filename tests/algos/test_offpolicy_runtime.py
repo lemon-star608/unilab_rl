@@ -12,6 +12,7 @@ def test_offpolicy_runtime_defaults_to_standard_sac_overrides() -> None:
     assert runtime.algo_type is None
     assert runtime.actor_adapter_modules == ()
     assert runtime.build_model_kwargs(obs_dim=4, critic_obs_dim=6) == {}
+    assert runtime.iteration_hook is None
 
 
 def test_offpolicy_runtime_rejects_marker_without_resolver() -> None:

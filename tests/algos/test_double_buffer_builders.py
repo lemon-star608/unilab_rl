@@ -180,6 +180,26 @@ def test_sac_builder_forwards_backend_device_binder(
     assert settings.replay_ingress_slot_rows == 4
 
 
+def test_sac_builder_forwards_runtime_iteration_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uni_rl.algos.sac.double_buffer as module
+
+    monkeypatch.setattr(module, "SACLearner", _FakeLearner)
+    monkeypatch.setattr(module, "DoubleBufferOffPolicyRunner", _FakeRunner)
+    cfg = _sac_cfg()
+    cfg.algo.runtime_resolver = f"{__name__}:resolve_iteration_runtime"
+    runner = module.build_sac_double_buffer_runner(
+        cfg,
+        env_factory=_fake_env_factory,
+        env_cfg_override=None,
+        replay_prefetch_mode="one_tick",
+        device="cpu",
+    )
+
+    assert runner.kwargs["iteration_hook"] is _iteration_hook
+
+
 @pytest.mark.parametrize("with_binder", [False, True])
 def test_flashsac_builder_forwards_backend_device_binder(
     monkeypatch: pytest.MonkeyPatch, with_binder: bool
@@ -229,6 +249,32 @@ def test_flashsac_builder_forwards_backend_device_binder(
         "min_weight": 0.1,
         "num_buckets": 2000,
     }
+
+
+def test_flashsac_builder_forwards_runtime_iteration_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import uni_rl.algos.flash_sac.double_buffer as module
+    from uni_rl.offpolicy.runtime import OffPolicyRuntime
+
+    _patch_flashsac_builder(module, monkeypatch)
+    cfg = _flashsac_cfg()
+    cfg.algo.runtime_resolver = f"{__name__}:resolve_iteration_runtime"
+    runner = _build_flashsac_runner(cfg)
+
+    assert runner.kwargs["iteration_hook"] is _iteration_hook
+
+
+def _iteration_hook(runner, iteration, env_steps, log_dir):
+    del runner, iteration, env_steps, log_dir
+    return {"Eval/owner_metric": 1.0}
+
+
+def resolve_iteration_runtime(rl_cfg):
+    from uni_rl.offpolicy.runtime import OffPolicyRuntime
+
+    del rl_cfg
+    return OffPolicyRuntime(iteration_hook=_iteration_hook)
 
 
 @pytest.mark.parametrize("algo", ["sac", "flashsac"])

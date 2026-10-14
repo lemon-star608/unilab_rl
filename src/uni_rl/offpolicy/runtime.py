@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from uni_rl.offpolicy.double_buffer_runner import DoubleBufferOffPolicyRunner
     from uni_rl.offpolicy.warmup import OffPolicyWarmupContext
 
 
@@ -27,6 +28,9 @@ class OffPolicyRuntime:
     actor_adapter_modules: tuple[str, ...] = ()
     learner_prepare_hook: Callable[[Any, OffPolicyWarmupContext], None] | None = None
     replay_pipeline_factory: Callable[..., Any] | None = None
+    iteration_hook: (
+        Callable[[DoubleBufferOffPolicyRunner, int, int, str], dict[str, float] | None] | None
+    ) = None
 
     def build_model_kwargs(self, *, obs_dim: int, critic_obs_dim: int) -> dict[str, Any]:
         """Build learner model kwargs from the environment observation contract."""
